@@ -1,0 +1,17 @@
+{
+  "height": 10,
+  "width": 10,
+  "episodes_per_phase": 500,
+  "rep_dim": 16,
+  "lr_psi": 0.01,
+  "batch_size": 128,
+  "replay_capacity": 1000,
+  "max_steps": 50,
+  "gamma": 0.99,
+  "entropy_coeff": 0.1,
+  "episodes_per_upd": 1,
+  "eval_freq": 1,
+  "norm": true,
+  "clear_replay_on_phase_change": false,
+  "seeds": [42, 123, 456]
+}
