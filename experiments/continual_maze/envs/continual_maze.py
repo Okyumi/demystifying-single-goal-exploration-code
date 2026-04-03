@@ -1,103 +1,74 @@
 """
-ContinualMaze environment for testing SGCRL adaptation.
+ContinualMaze environment for testing SGCRL adaptation to changing dynamics.
 
-The maze keeps a FIXED goal but CHANGES wall layout at configurable
-training-step intervals.  Each phase has a different maze structure,
-forcing the agent to adapt its path.
+The goal position is FIXED across all phases. The maze wall layout CHANGES
+at configurable training step intervals. Each phase has a different maze
+structure but same goal, forcing the agent to adapt its path.
 """
 
-from __future__ import annotations
-
-import copy
-from dataclasses import dataclass, field
-from typing import List, Tuple
-
 import numpy as np
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional
 
 
 # ---------------------------------------------------------------------------
-# Maze construction helpers
+# Wall layout generators
 # ---------------------------------------------------------------------------
 
-def build_fourrooms_walls(height: int = 10, width: int = 10,
-                          door_len: int = 2) -> np.ndarray:
-    """Standard FourRooms wall layout (Phase 1).
-
-    Horizontal wall at row height//2, vertical wall at col width//2,
-    with two door openings in each wall.
-    """
+def create_fourrooms_walls(height: int = 10, width: int = 10,
+                           door_len: int = 2) -> np.ndarray:
+    """Standard four-rooms layout with horizontal and vertical walls."""
     walls = np.zeros((height, width), dtype=int)
-
-    # Horizontal wall
+    # Horizontal wall at midpoint
     walls[height // 2, :] = 1
     doors_h = np.concatenate([
         width // 4 + np.arange(door_len),
         width * 3 // 4 + np.arange(door_len),
-    ]).astype(int)
+    ])
     walls[height // 2, doors_h] = 0
-
-    # Vertical wall
+    # Vertical wall at midpoint
     walls[:, width // 2] = 1
     doors_v = np.concatenate([
         height // 4 + np.arange(door_len),
         height * 3 // 4 + np.arange(door_len),
-    ]).astype(int)
+    ])
     walls[doors_v, width // 2] = 0
-
     return walls
 
 
-def build_shortcut_walls(height: int = 10, width: int = 10,
+def create_shortcut_walls(height: int = 10, width: int = 10,
+                          door_len: int = 2) -> np.ndarray:
+    """Four-rooms with an extra shortcut: a gap opened in the horizontal wall
+    near column 0, creating a direct path from top-left to bottom-left."""
+    walls = create_fourrooms_walls(height, width, door_len)
+    # Open a 2-cell gap at the left end of the horizontal wall
+    walls[height // 2, 0:2] = 0
+    return walls
+
+
+def create_reroute_walls(height: int = 10, width: int = 10,
                          door_len: int = 2) -> np.ndarray:
-    """Phase 2: FourRooms + remove part of the vertical wall in the
-    bottom-right quadrant, creating a shorter path from start to goal.
-
-    Opens a direct corridor through the vertical wall at rows 6-8
-    (below horizontal wall), allowing the agent to go right from the
-    bottom-left room directly into the bottom-right room without
-    needing the existing doors.
-    """
-    walls = build_fourrooms_walls(height, width, door_len)
-    # Open a wide passage in the vertical wall for rows 6,7,8
-    # (the bottom half, below horizontal wall at row 5)
-    walls[6, width // 2] = 0
-    walls[7, width // 2] = 0
-    walls[8, width // 2] = 0
-    return walls
-
-
-def build_blocked_walls(height: int = 10, width: int = 10,
-                        door_len: int = 2) -> np.ndarray:
-    """Phase 3: Block the doors in the bottom half of the vertical wall
-    and open a new path through the top half.
-
-    This forces the agent to find a path through the top rooms
-    instead of the bottom rooms.
-    """
-    walls = build_fourrooms_walls(height, width, door_len)
-
-    # Block the bottom-half vertical-wall doors (rows 7,8)
-    walls[7, width // 2] = 1
-    walls[8, width // 2] = 1
-
-    # Block the bottom horizontal-wall doors (cols 7,8)
-    walls[height // 2, 7] = 1
-    walls[height // 2, 8] = 1
-
-    # Open a wide passage in the vertical wall for rows 0-3 (top half)
-    walls[0, width // 2] = 0
-    walls[1, width // 2] = 0
-
-    # Open a wide passage in the horizontal wall near the right side
-    # so agent can descend from top-right to bottom-right room
-    walls[height // 2, 8] = 0
-    walls[height // 2, 9] = 0
-
+    """Four-rooms where the original bottom-right door in the vertical wall
+    is BLOCKED, forcing use of a new gap at bottom row of the vertical wall."""
+    walls = create_fourrooms_walls(height, width, door_len)
+    # Block the original lower-right door in the vertical wall (rows 7,8)
+    walls[height * 3 // 4: height * 3 // 4 + door_len, width // 2] = 1
+    # Open a new gap at the very bottom of the vertical wall
+    walls[height - 2: height, width // 2] = 0
     return walls
 
 
 # ---------------------------------------------------------------------------
-# Phase description
+# Pre-built wall configs
+# ---------------------------------------------------------------------------
+
+FOUR_ROOMS_STANDARD = create_fourrooms_walls()
+FOUR_ROOMS_SHORTCUT = create_shortcut_walls()
+FOUR_ROOMS_REROUTE = create_reroute_walls()
+
+
+# ---------------------------------------------------------------------------
+# Maze phase configuration
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -108,159 +79,172 @@ class MazePhase:
     num_episodes: int
     description: str = ""
 
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "num_episodes": int(self.num_episodes),
+            "description": self.description,
+            "walls": [[int(c) for c in row] for row in self.walls],
+        }
+
 
 # ---------------------------------------------------------------------------
 # ContinualMaze environment
 # ---------------------------------------------------------------------------
 
 class ContinualMaze:
-    """Tabular maze whose wall layout changes across phases.
+    """A tabular maze environment with phase-changing wall layouts.
 
     Parameters
     ----------
+    phases : list of MazePhase
+        Ordered list of maze configurations and their durations.
     height, width : int
-        Grid dimensions.
+        Grid dimensions (must be consistent across all phase wall arrays).
     start_state : int
-        Flat index of the start position.
+        Flattened index of the start position (fixed across phases).
     goal_state : int
-        Flat index of the goal position (fixed across all phases).
-    phases : list[MazePhase]
-        Ordered list of phases.  Each carries its own wall array and
-        a duration in training episodes.
+        Flattened index of the goal position (fixed across phases).
     """
 
-    NUM_ACTIONS = 5
-    A_TO_DELTA = np.array([[0, 0],   # stay
-                           [1, 0],   # down
-                           [-1, 0],  # up
-                           [0, 1],   # right
-                           [0, -1]]) # left
+    NUM_ACTIONS = 5  # stay, down, up, right, left
+    A_TO_DELTA = np.array([[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1]])
 
-    def __init__(
-        self,
-        height: int,
-        width: int,
-        start_state: int,
-        goal_state: int,
-        phases: List[MazePhase],
-    ):
+    def __init__(self, phases: List[MazePhase],
+                 height: int = 10, width: int = 10,
+                 start_state: Optional[int] = None,
+                 goal_state: Optional[int] = None):
+        assert len(phases) > 0, "Need at least one phase"
         self.height = height
         self.width = width
-        self.start_state = start_state
-        self.goal_state = goal_state
-        self.phases = phases
         self.num_states = height * width
-        self.shape = (height, width)
+        self.phases = phases
 
-        # Current phase bookkeeping
+        # Default start/goal: top-left / bottom-right
+        self.start_state = start_state if start_state is not None else 0
+        self.goal_state = (goal_state if goal_state is not None
+                           else np.ravel_multi_index((height - 1, width - 1),
+                                                     (height, width)))
+
+        # Validate all wall arrays
+        for p in phases:
+            assert p.walls.shape == (height, width), \
+                f"Phase '{p.name}' walls shape {p.walls.shape} != ({height}, {width})"
+            # Ensure start and goal are not walled off
+            si, sj = np.unravel_index(self.start_state, (height, width))
+            gi, gj = np.unravel_index(self.goal_state, (height, width))
+            assert p.walls[si, sj] == 0, f"Start is walled in phase '{p.name}'"
+            assert p.walls[gi, gj] == 0, f"Goal is walled in phase '{p.name}'"
+
+        # Start in phase 0
         self._phase_idx = 0
-        self._episodes_in_phase = 0
-        self._total_episodes = 0
-        self.walls = self.phases[0].walls.copy()
+        self._walls = self.phases[0].walls.copy()
 
-        # Log of phase transitions: list of (episode, phase_idx)
-        self.phase_log: List[Tuple[int, int]] = [(0, 0)]
+    # -- Phase management ---------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # Phase management
-    # ------------------------------------------------------------------
+    @property
+    def current_phase_idx(self) -> int:
+        return self._phase_idx
 
     @property
     def current_phase(self) -> MazePhase:
         return self.phases[self._phase_idx]
 
     @property
-    def phase_idx(self) -> int:
-        return self._phase_idx
+    def walls(self) -> np.ndarray:
+        return self._walls
 
-    @property
-    def total_episodes(self) -> int:
-        return self._total_episodes
+    def set_phase(self, phase_idx: int):
+        """Switch to a specific phase."""
+        assert 0 <= phase_idx < len(self.phases)
+        self._phase_idx = phase_idx
+        self._walls = self.phases[phase_idx].walls.copy()
 
-    def advance_episode(self) -> bool:
-        """Call after each training episode.
-
-        Returns True if a phase transition occurred.
-        """
-        self._total_episodes += 1
-        self._episodes_in_phase += 1
-
-        if (self._episodes_in_phase >= self.current_phase.num_episodes
-                and self._phase_idx < len(self.phases) - 1):
-            self._phase_idx += 1
-            self._episodes_in_phase = 0
-            self.walls = self.phases[self._phase_idx].walls.copy()
-            self.phase_log.append((self._total_episodes, self._phase_idx))
+    def advance_phase(self) -> bool:
+        """Advance to the next phase. Returns True if there is a next phase."""
+        if self._phase_idx + 1 < len(self.phases):
+            self.set_phase(self._phase_idx + 1)
             return True
         return False
 
-    def total_num_episodes(self) -> int:
-        return sum(p.num_episodes for p in self.phases)
-
-    # ------------------------------------------------------------------
-    # Transition dynamics
-    # ------------------------------------------------------------------
+    # -- Dynamics -----------------------------------------------------------
 
     def step(self, state: int, action: int) -> int:
-        """Deterministic transition."""
+        """Deterministic step in the current wall layout."""
         di, dj = self.A_TO_DELTA[action]
-        i, j = np.unravel_index(state, self.shape)
+        i, j = np.unravel_index(state, (self.height, self.width))
         ni, nj = int(i + di), int(j + dj)
-        if 0 <= ni < self.height and 0 <= nj < self.width and self.walls[ni, nj] == 0:
-            return int(np.ravel_multi_index((ni, nj), self.shape))
-        return state
+        if 0 <= ni < self.height and 0 <= nj < self.width and self._walls[ni, nj] == 0:
+            return int(np.ravel_multi_index((ni, nj), (self.height, self.width)))
+        return state  # blocked
 
-    def is_near_goal(self, state: int, dist: int = 1) -> bool:
-        si, sj = np.unravel_index(state, self.shape)
-        gi, gj = np.unravel_index(self.goal_state, self.shape)
-        return abs(int(si) - int(gi)) + abs(int(sj) - int(gj)) <= dist
+    def is_goal(self, state: int) -> bool:
+        """Exact goal check."""
+        return state == self.goal_state
+
+    def is_near_goal(self, state: int, threshold: int = 1) -> bool:
+        """Manhattan-distance goal proximity check."""
+        si, sj = np.unravel_index(state, (self.height, self.width))
+        gi, gj = np.unravel_index(self.goal_state, (self.height, self.width))
+        return abs(int(si) - int(gi)) + abs(int(sj) - int(gj)) <= threshold
 
     def state_to_coord(self, state: int) -> Tuple[int, int]:
-        return tuple(np.unravel_index(state, self.shape))
+        return tuple(np.unravel_index(state, (self.height, self.width)))
 
     def coord_to_state(self, row: int, col: int) -> int:
-        return int(np.ravel_multi_index((row, col), self.shape))
+        return int(np.ravel_multi_index((row, col), (self.height, self.width)))
 
-    # ------------------------------------------------------------------
-    # Convenience builders
-    # ------------------------------------------------------------------
+    # -- Utility ------------------------------------------------------------
 
-    @classmethod
-    def make_default(
-        cls,
-        episodes_per_phase: int = 500,
-        height: int = 10,
-        width: int = 10,
-    ) -> "ContinualMaze":
-        """Build the standard 3-phase continual maze."""
-        start = int(np.ravel_multi_index((0, 0), (height, width)))
-        goal = int(np.ravel_multi_index((9, 9), (height, width)))
+    def get_open_states(self) -> np.ndarray:
+        """Return flat indices of all non-wall states in current phase."""
+        return np.where(self._walls.ravel() == 0)[0]
 
-        phases = [
-            MazePhase(
-                name="fourrooms",
-                walls=build_fourrooms_walls(height, width),
-                num_episodes=episodes_per_phase,
-                description="Standard FourRooms layout",
-            ),
-            MazePhase(
-                name="shortcut",
-                walls=build_shortcut_walls(height, width),
-                num_episodes=episodes_per_phase,
-                description="Shortcut opened in vertical wall (bottom half)",
-            ),
-            MazePhase(
-                name="blocked",
-                walls=build_blocked_walls(height, width),
-                num_episodes=episodes_per_phase,
-                description="Bottom path blocked, top path opened",
-            ),
-        ]
+    def get_config(self) -> dict:
+        """Serialisable configuration for reproducibility."""
+        return {
+            "height": int(self.height),
+            "width": int(self.width),
+            "start_state": int(self.start_state),
+            "goal_state": int(self.goal_state),
+            "phases": [p.to_dict() for p in self.phases],
+        }
 
-        return cls(
-            height=height,
-            width=width,
-            start_state=start,
-            goal_state=goal,
-            phases=phases,
-        )
+
+# ---------------------------------------------------------------------------
+# Convenience: default 3-phase continual maze
+# ---------------------------------------------------------------------------
+
+def make_default_continual_maze(episodes_per_phase: int = 500) -> ContinualMaze:
+    """Create the default 3-phase continual maze experiment.
+
+    Phase 1 (Standard FourRooms):
+        Agent must navigate through the canonical door sequence.
+    Phase 2 (Shortcut):
+        A new gap opens in the horizontal wall near column 0,
+        creating a shorter path. Does the agent switch?
+    Phase 3 (Reroute):
+        The lower-right vertical-wall door is blocked and a new
+        gap opens at the bottom. The agent must re-explore.
+    """
+    phases = [
+        MazePhase(
+            name="standard",
+            walls=FOUR_ROOMS_STANDARD,
+            num_episodes=episodes_per_phase,
+            description="Standard FourRooms — canonical door sequence",
+        ),
+        MazePhase(
+            name="shortcut",
+            walls=FOUR_ROOMS_SHORTCUT,
+            num_episodes=episodes_per_phase,
+            description="Shortcut opened at left side of horizontal wall",
+        ),
+        MazePhase(
+            name="reroute",
+            walls=FOUR_ROOMS_REROUTE,
+            num_episodes=episodes_per_phase,
+            description="Lower-right door blocked, new gap at bottom of vertical wall",
+        ),
+    ]
+    return ContinualMaze(phases=phases)

@@ -1,1 +1,1 @@
-from .metrics import compute_all_metrics
+from .metrics import MetricsCollector

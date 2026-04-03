@@ -1,88 +1,86 @@
 # Continual Maze SGCRL Experiment
 
-This experiment tests whether SGCRL (Single-Goal Contrastive RL) overexploits a discovered path and fails to adapt when the maze dynamics change.
+Tests the hypothesis that SGCRL overexploits a single successful path and fails to adapt when maze dynamics change.
 
-## Hypothesis
+## Setup
 
-Once SGCRL finds one successful trajectory, it overexploits that path and fails to explore alternatives — especially when maze dynamics change.
+A 10x10 tabular FourRooms maze where:
+- **Goal position is fixed** at (9,9) across all phases
+- **Wall layout changes** at configurable episode intervals
+- Each phase has a different maze structure with different optimal paths
 
-## Experiment Design
+### Maze Phases
 
-### 3-Phase Continual Maze
-
-The maze is a 10x10 grid with a **fixed goal** at (9,9) and **start** at (0,0). The wall layout changes across three phases:
-
-- **Phase 1 (FourRooms):** Standard 4-room layout with doors. Agent must navigate through room sequence to reach the goal.
-- **Phase 2 (Shortcut):** A new direct passage opens in the vertical wall (bottom half), creating a shorter path. Does the agent switch to it?
-- **Phase 3 (Blocked):** Bottom-half doors are blocked, and a new top-half passage opens. The agent *must* re-explore through the top rooms.
-
-Each phase runs for a configurable number of episodes (default: 500).
+| Phase | Name | Description |
+|-------|------|-------------|
+| 1 | `standard` | Standard FourRooms — agent navigates through canonical door sequence |
+| 2 | `shortcut` | A new gap opens at left side of horizontal wall — shorter path available |
+| 3 | `reroute` | Lower-right vertical door blocked, new gap at bottom — must re-explore |
 
 ### Agent
 
-Tabular SGCRL with lookup-table ψ embeddings (no neural networks). The agent selects actions by computing ψ(s')·ψ(g) similarity for each neighbor state and sampling from a softmax policy. Representations are updated via a vectorized InfoNCE contrastive loss.
+Tabular SGCRL from the paper: each state has a learnable ψ embedding vector. Actions are selected via softmax over ψ(s')·ψ(g) similarities. Representations are updated with InfoNCE contrastive loss on (state, future-state) pairs from a replay buffer.
 
-### Metrics
-
-1. **Success rate** — per-phase fraction of episodes reaching the goal
-2. **Path diversity** — Jaccard distance between trajectories, number of distinct routes, route entropy
-3. **Trajectory preference** — fraction of successful episodes using each route
-4. **Adaptation speed** — episodes from phase transition to first success
-5. **ψ-similarity evolution** — ψ(s)·ψ(g) heatmaps at regular intervals
-6. **Representation drift** — L2 distance and cosine similarity of ψ vectors at phase transitions
-7. **Exploitation ratio** — fraction of successful episodes using the dominant path
-
-## Quick Start
+## Running
 
 ```bash
-# Run with default config (3 seeds, 500 episodes/phase)
+# Default experiment (500 episodes/phase, seed 42)
 python experiments/continual_maze/run_experiment.py
 
-# Run with quick config for testing (1 seed, 100 episodes/phase)
-python experiments/continual_maze/run_experiment.py --config experiments/continual_maze/configs/quick.json
+# With config file
+python experiments/continual_maze/run_experiment.py --config experiments/continual_maze/configs/default.json
 
-# Run with specific seeds
-python experiments/continual_maze/run_experiment.py --seeds 0 1 2 3 4
+# Override parameters
+python experiments/continual_maze/run_experiment.py --seed 123 --episodes_per_phase 1000
 
-# Run with replay buffer clearing at phase transitions
+# Clear replay buffer at phase transitions
 python experiments/continual_maze/run_experiment.py --config experiments/continual_maze/configs/clear_replay.json
 
-# Analyze results
-python experiments/continual_maze/analyze_results.py experiments/continual_maze/results/run_XXX/
+# Longer run
+python experiments/continual_maze/run_experiment.py --config experiments/continual_maze/configs/long_run.json
 ```
+
+## Analysis
+
+```bash
+# Print summary + generate figures
+python experiments/continual_maze/analyze_results.py experiments/continual_maze/results/seed_42
+```
+
+## Metrics
+
+| Metric | Description |
+|--------|-------------|
+| **Success rate** | Per-phase fraction of episodes reaching the goal |
+| **Path diversity** | Jaccard distance, route clusters, entropy over successful trajectories |
+| **Trajectory preference** | Fraction of successful episodes using each route cluster |
+| **Adaptation speed** | Episodes from phase transition to first success |
+| **ψ-similarity evolution** | Snapshots of ψ(s)·ψ(g) for all states over training |
+| **Representation drift** | L2 distance and cosine similarity of ψ before vs. after phase transitions |
+| **Exploitation ratio** | Fraction of successful episodes using the dominant path |
 
 ## Output Structure
 
 ```
-results/run_XXX/
-  config.json                  # experiment configuration
-  summary.json                 # cross-seed aggregated summary
-  metrics_seed_42.json         # per-seed detailed metrics
-  psi_snapshots_seed_42.npz    # ψ-similarity maps over training
-  plots/
+results/seed_42/
+  config.json          # experiment configuration
+  env_config.json      # maze phase definitions
+  metrics.json         # all computed metrics
+  psi_final.npy        # final ψ embeddings (100 x rep_dim)
+  psi_snapshots/       # ψ(s)·ψ(g) similarity maps at regular intervals
+    psi_sim_ep00000_phase0.npy
+    ...
+  figures/             # generated by analyze_results.py
     success_rate.png
-    exploitation_ratio.png
+    psi_similarity_evolution.png
     path_diversity.png
-    psi_evolution_seed_42.png
-    representation_drift.png
+    exploitation_ratio.png
 ```
 
-## Configuration
+## Configs
 
-See `configs/default.json` for all parameters. Key settings:
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `episodes_per_phase` | 500 | Training episodes per maze phase |
-| `rep_dim` | 16 | ψ embedding dimension |
-| `lr_psi` | 0.01 | Learning rate for contrastive updates |
-| `entropy_coeff` | 0.1 | Softmax temperature (lower = more greedy) |
-| `clear_replay_on_phase_change` | false | Whether to clear replay buffer at transitions |
-| `seeds` | [42, 123, 456] | Random seeds for reproducibility |
-
-## Interpreting Results
-
-- **High exploitation ratio** (close to 1.0) across phases supports the hypothesis that SGCRL overexploits a single path.
-- **Low path diversity** (few distinct routes, low entropy) indicates the agent consistently uses the same path.
-- **Slow adaptation** (many episodes to first success after phase change) suggests the learned representations are rigid.
-- **Small representation drift** at phase transitions would indicate ψ embeddings resist change even when the environment changes.
+| Config | Description |
+|--------|-------------|
+| `default.json` | 500 episodes/phase, standard hyperparameters |
+| `long_run.json` | 2000 episodes/phase for more thorough evaluation |
+| `clear_replay.json` | Clears replay buffer at phase transitions (ablation) |

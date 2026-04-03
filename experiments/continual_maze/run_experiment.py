@@ -1,37 +1,37 @@
 #!/usr/bin/env python3
 """
-Main experiment runner for the Continual Maze SGCRL experiment.
+Main experiment runner for the Continual Maze SGCRL experiments.
 
 Usage:
     python experiments/continual_maze/run_experiment.py
-    python experiments/continual_maze/run_experiment.py --config experiments/continual_maze/configs/quick.json
-    python experiments/continual_maze/run_experiment.py --seeds 0 1 2 3 4
-"""
+    python experiments/continual_maze/run_experiment.py --config experiments/continual_maze/configs/default.json
+    python experiments/continual_maze/run_experiment.py --seed 42 --episodes_per_phase 500
 
-from __future__ import annotations
+The script:
+  1. Builds a ContinualMaze with configurable phases
+  2. Trains a tabular SGCRL agent, switching maze layouts on schedule
+  3. Collects all metrics (success rate, path diversity, ψ-similarity, etc.)
+  4. Saves results to JSON + numpy files
+"""
 
 import argparse
 import json
 import os
 import sys
 import time
-from pathlib import Path
-from typing import Dict, List
-
 import numpy as np
+from pathlib import Path
 
-# Allow running from repo root
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+# Ensure the repo root is on the path so the package is importable
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
 
 from experiments.continual_maze.envs.continual_maze import (
-    ContinualMaze,
-    MazePhase,
-    build_blocked_walls,
-    build_fourrooms_walls,
-    build_shortcut_walls,
+    ContinualMaze, MazePhase, make_default_continual_maze,
+    FOUR_ROOMS_STANDARD, FOUR_ROOMS_SHORTCUT, FOUR_ROOMS_REROUTE,
 )
-from experiments.continual_maze.metrics.metrics import compute_all_metrics
-from experiments.continual_maze.sgcrl_agent import SGCRLAgent
+from experiments.continual_maze.agent import TabularSGCRLAgent
+from experiments.continual_maze.metrics.metrics import MetricsCollector
 
 
 # -----------------------------------------------------------------------
@@ -39,11 +39,7 @@ from experiments.continual_maze.sgcrl_agent import SGCRLAgent
 # -----------------------------------------------------------------------
 
 DEFAULT_CONFIG = {
-    # Environment
-    "height": 10,
-    "width": 10,
-    "episodes_per_phase": 500,
-    # Agent
+    # Agent hyperparameters
     "rep_dim": 16,
     "lr_psi": 1e-2,
     "batch_size": 128,
@@ -51,65 +47,51 @@ DEFAULT_CONFIG = {
     "max_steps": 50,
     "gamma": 0.99,
     "entropy_coeff": 0.1,
-    "episodes_per_upd": 1,
-    "eval_freq": 1,
-    "norm": True,
-    "clear_replay_on_phase_change": False,
-    # Experiment
-    "seeds": [42],
+    "episodes_per_update": 1,
+    "normalize": True,
+
+    # Phase schedule
+    "episodes_per_phase": 500,
+
+    # Experiment control
+    "seed": 42,
+    "eval_freq": 5,          # run eval episode every N episodes
+    "psi_snapshot_freq": 25,  # save ψ snapshot every N episodes
+    "clear_replay_on_transition": False,  # whether to empty buffer on phase change
+
+    # Output
+    "output_dir": None,  # set below if not provided
 }
 
 
+def load_config(path: str) -> dict:
+    with open(path) as f:
+        return json.load(f)
+
+
+def merge_configs(base: dict, overrides: dict) -> dict:
+    merged = dict(base)
+    for k, v in overrides.items():
+        if v is not None:
+            merged[k] = v
+    return merged
+
+
 # -----------------------------------------------------------------------
-# Experiment
+# Experiment runner
 # -----------------------------------------------------------------------
 
-def build_env(config: Dict) -> ContinualMaze:
-    """Build the 3-phase ContinualMaze from config."""
-    h, w = config["height"], config["width"]
-    epp = config["episodes_per_phase"]
+def run_experiment(config: dict):
+    seed = config["seed"]
+    np.random.seed(seed)
 
-    phases = [
-        MazePhase(
-            name="fourrooms",
-            walls=build_fourrooms_walls(h, w),
-            num_episodes=epp,
-            description="Standard FourRooms layout",
-        ),
-        MazePhase(
-            name="shortcut",
-            walls=build_shortcut_walls(h, w),
-            num_episodes=epp,
-            description="Shortcut opened in vertical wall (bottom half)",
-        ),
-        MazePhase(
-            name="blocked",
-            walls=build_blocked_walls(h, w),
-            num_episodes=epp,
-            description="Bottom path blocked, top path opened",
-        ),
-    ]
+    # Build environment
+    env = make_default_continual_maze(
+        episodes_per_phase=config["episodes_per_phase"])
 
-    start = int(np.ravel_multi_index((0, 0), (h, w)))
-    goal = int(np.ravel_multi_index((h - 1, w - 1), (h, w)))
-
-    return ContinualMaze(
-        height=h, width=w,
-        start_state=start, goal_state=goal,
-        phases=phases,
-    )
-
-
-def run_single_seed(config: Dict, seed: int, verbose: bool = True) -> Dict:
-    """Run one experiment with a given seed.  Returns results + metrics."""
-    if verbose:
-        print(f"\n{'='*60}")
-        print(f"  Seed {seed}")
-        print(f"{'='*60}")
-
-    env = build_env(config)
-    agent = SGCRLAgent(
-        env=env,
+    # Build agent
+    agent = TabularSGCRLAgent(
+        env,
         rep_dim=config["rep_dim"],
         lr_psi=config["lr_psi"],
         batch_size=config["batch_size"],
@@ -117,135 +99,156 @@ def run_single_seed(config: Dict, seed: int, verbose: bool = True) -> Dict:
         max_steps=config["max_steps"],
         gamma=config["gamma"],
         entropy_coeff=config["entropy_coeff"],
-        episodes_per_upd=config["episodes_per_upd"],
-        eval_freq=config["eval_freq"],
-        norm=config["norm"],
-        clear_replay_on_phase_change=config["clear_replay_on_phase_change"],
-        seed=seed,
+        episodes_per_update=config["episodes_per_update"],
+        normalize=config["normalize"],
     )
+
+    # Metrics
+    metrics = MetricsCollector(
+        num_states=env.num_states,
+        maze_shape=(env.height, env.width),
+    )
+
+    # Total episodes across all phases
+    total_episodes = sum(p.num_episodes for p in env.phases)
+    phase_boundaries = []
+    cumulative = 0
+    for p in env.phases:
+        phase_boundaries.append(cumulative)
+        cumulative += p.num_episodes
+
+    current_phase_idx = 0
+    env.set_phase(0)
+
+    # Track ψ at start of each phase for drift measurement
+    psi_at_phase_start: dict = {0: agent.get_psi_snapshot()}
+
+    print(f"=== Continual Maze Experiment ===")
+    print(f"Seed: {seed}")
+    print(f"Total episodes: {total_episodes}")
+    print(f"Phases: {[p.name for p in env.phases]}")
+    print(f"Episodes per phase: {[p.num_episodes for p in env.phases]}")
+    print()
 
     t0 = time.time()
-    results = agent.train(verbose=verbose)
+
+    for ep in range(total_episodes):
+        # Check for phase transition
+        next_phase_idx = current_phase_idx
+        for i, boundary in enumerate(phase_boundaries):
+            if ep >= boundary:
+                next_phase_idx = i
+
+        if next_phase_idx != current_phase_idx:
+            # "before" = ψ at END of the previous phase (after training)
+            psi_before = agent.get_psi_snapshot()
+            # "after" = ψ at START of previous phase (before training)
+            # Drift = how much ψ changed during the previous phase
+            psi_phase_start = psi_at_phase_start.get(current_phase_idx,
+                                                      psi_before)
+            metrics.record_phase_transition(ep, psi_phase_start, psi_before,
+                                            current_phase_idx)
+
+            env.set_phase(next_phase_idx)
+            current_phase_idx = next_phase_idx
+            psi_at_phase_start[current_phase_idx] = agent.get_psi_snapshot()
+
+            if config["clear_replay_on_transition"]:
+                agent.clear_replay()
+
+            print(f"  [Episode {ep}] Phase transition -> "
+                  f"'{env.current_phase.name}'")
+
+        # Collect training episode
+        traj, success = agent.collect_episode()
+        metrics.record_episode(ep, current_phase_idx, traj, success)
+
+        # Contrastive update
+        if ep % agent.episodes_per_update == 0:
+            agent.update_representations()
+
+        # Periodic eval + ψ snapshot
+        if ep % config["eval_freq"] == 0:
+            eval_traj, eval_success = agent.run_eval_episode()
+            # (eval episodes are recorded separately for logging only)
+
+        if ep % config["psi_snapshot_freq"] == 0:
+            sim_map = agent.get_similarity_map()
+            metrics.record_psi_snapshot(ep, current_phase_idx, sim_map)
+
+        # Progress report
+        if (ep + 1) % 100 == 0:
+            recent = metrics.episode_success[max(0, ep - 99):ep + 1]
+            rate = np.mean(recent)
+            elapsed = time.time() - t0
+            print(f"  [Episode {ep + 1}/{total_episodes}]  "
+                  f"phase={env.current_phase.name}  "
+                  f"success(last100)={rate:.2f}  "
+                  f"elapsed={elapsed:.1f}s")
+
     elapsed = time.time() - t0
+    print(f"\nTraining complete in {elapsed:.1f}s")
 
-    if verbose:
-        print(f"  Training completed in {elapsed:.1f}s")
+    # ------------------------------------------------------------------
+    # Save results
+    # ------------------------------------------------------------------
+    output_dir = config.get("output_dir") or os.path.join(
+        str(REPO_ROOT), "experiments", "continual_maze", "results",
+        f"seed_{seed}")
+    os.makedirs(output_dir, exist_ok=True)
 
-    metrics = compute_all_metrics(
-        results,
-        maze_shape=(config["height"], config["width"]),
-        goal_state=env.goal_state,
-    )
+    # Save config
+    config_save = dict(config)
+    with open(os.path.join(output_dir, "config.json"), "w") as f:
+        json.dump(config_save, f, indent=2)
 
-    return {
-        "seed": seed,
-        "config": config,
-        "metrics": metrics,
-        "elapsed_s": elapsed,
-        "phase_log": [(int(e), int(p)) for e, p in env.phase_log],
-    }
+    # Save metrics
+    metrics_dict = metrics.to_dict()
+    with open(os.path.join(output_dir, "metrics.json"), "w") as f:
+        json.dump(metrics_dict, f, indent=2)
 
+    # Save ψ snapshots as numpy arrays (more compact than JSON)
+    psi_dir = os.path.join(output_dir, "psi_snapshots")
+    os.makedirs(psi_dir, exist_ok=True)
+    for ep, phase, sim_map in metrics.psi_snapshots:
+        np.save(os.path.join(psi_dir, f"psi_sim_ep{ep:05d}_phase{phase}.npy"),
+                sim_map)
 
-def save_results(all_results: List[Dict], out_dir: Path):
-    """Save experiment results to disk."""
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # Save final ψ embeddings
+    np.save(os.path.join(output_dir, "psi_final.npy"), agent.psi)
 
-    # Save per-seed results (metrics only — trajectories are too large)
-    for res in all_results:
-        seed = res["seed"]
-        fname = out_dir / f"metrics_seed_{seed}.json"
+    # Save environment config
+    with open(os.path.join(output_dir, "env_config.json"), "w") as f:
+        json.dump(env.get_config(), f, indent=2)
 
-        # Strip non-serialisable numpy from psi_similarity snapshots
-        metrics_copy = _make_serialisable(res["metrics"])
-        payload = {
-            "seed": seed,
-            "config": res["config"],
-            "metrics": metrics_copy,
-            "elapsed_s": res["elapsed_s"],
-            "phase_log": res["phase_log"],
-        }
-        with open(fname, "w") as f:
-            json.dump(payload, f, indent=2)
-        print(f"  Saved {fname}")
+    print(f"Results saved to {output_dir}")
 
-    # Save psi similarity snapshots as numpy arrays
-    for res in all_results:
-        seed = res["seed"]
-        snaps = res["metrics"]["psi_similarity"]["snapshots"]
-        sim_maps = np.array([s["similarity_map"] for s in snaps])
-        episodes = np.array([s["episode"] for s in snaps])
-        phases = np.array([s["phase_idx"] for s in snaps])
-        np.savez_compressed(
-            out_dir / f"psi_snapshots_seed_{seed}.npz",
-            similarity_maps=sim_maps,
-            episodes=episodes,
-            phases=phases,
-        )
+    # Print summary
+    print("\n=== Results Summary ===")
+    sr = metrics.success_rate_per_phase()
+    for p_idx, rate in sr.items():
+        print(f"  Phase {p_idx} ({env.phases[p_idx].name}): "
+              f"success={rate:.3f}")
 
-    # Save aggregated summary
-    summary = _aggregate_summary(all_results)
-    with open(out_dir / "summary.json", "w") as f:
-        json.dump(summary, f, indent=2)
-    print(f"  Saved {out_dir / 'summary.json'}")
+    adapt = metrics.adaptation_speed()
+    for p_idx, steps in adapt.items():
+        label = env.phases[p_idx].name if p_idx < len(env.phases) else "?"
+        print(f"  Phase {p_idx} ({label}): "
+              f"adaptation_speed={steps} episodes")
 
+    drift = metrics.representation_drift()
+    for d in drift:
+        print(f"  Phase {d['phase_idx']} transition: "
+              f"L2={d['mean_l2_distance']:.4f}  "
+              f"cos_sim={d['mean_cosine_similarity']:.4f}")
 
-def _make_serialisable(obj):
-    """Recursively convert numpy types to Python types."""
-    if isinstance(obj, dict):
-        return {k: _make_serialisable(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_make_serialisable(v) for v in obj]
-    if isinstance(obj, (np.integer,)):
-        return int(obj)
-    if isinstance(obj, (np.floating,)):
-        return float(obj)
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    return obj
+    exploit = metrics.exploitation_ratio()
+    for p_idx, ratio in exploit.items():
+        label = env.phases[p_idx].name if p_idx < len(env.phases) else "?"
+        print(f"  Phase {p_idx} ({label}): "
+              f"exploitation_ratio={ratio:.3f}")
 
-
-def _aggregate_summary(all_results: List[Dict]) -> Dict:
-    """Create a cross-seed summary of key metrics."""
-    seeds = [r["seed"] for r in all_results]
-    config = all_results[0]["config"]
-
-    # Gather per-phase success rates across seeds
-    phase_successes = {}
-    for r in all_results:
-        for p, v in r["metrics"]["success_rate"]["per_phase"].items():
-            phase_successes.setdefault(str(p), []).append(v)
-
-    phase_eval_successes = {}
-    for r in all_results:
-        for p, v in r["metrics"]["eval_success_rate"]["per_phase"].items():
-            phase_eval_successes.setdefault(str(p), []).append(v)
-
-    # Gather exploitation ratios
-    phase_exploit = {}
-    for r in all_results:
-        for p, v in r["metrics"]["exploitation_ratio"]["per_phase"].items():
-            phase_exploit.setdefault(str(p), []).append(v["exploitation_ratio"])
-
-    # Gather adaptation speed
-    adaptation = {}
-    for r in all_results:
-        for p, v in r["metrics"]["adaptation_speed"].items():
-            val = v["episodes_to_first_success"]
-            adaptation.setdefault(str(p), []).append(val if val is not None else -1)
-
-    def _stats(vals):
-        arr = np.array(vals, dtype=float)
-        return {"mean": float(arr.mean()), "std": float(arr.std()),
-                "min": float(arr.min()), "max": float(arr.max())}
-
-    return {
-        "seeds": seeds,
-        "config": config,
-        "per_phase_train_success": {p: _stats(v) for p, v in phase_successes.items()},
-        "per_phase_eval_success": {p: _stats(v) for p, v in phase_eval_successes.items()},
-        "per_phase_exploitation_ratio": {p: _stats(v) for p, v in phase_exploit.items()},
-        "adaptation_speed": {p: _stats(v) for p, v in adaptation.items()},
-    }
+    return metrics_dict
 
 
 # -----------------------------------------------------------------------
@@ -257,66 +260,28 @@ def main():
         description="Run continual maze SGCRL experiment")
     parser.add_argument("--config", type=str, default=None,
                         help="Path to JSON config file")
-    parser.add_argument("--seeds", type=int, nargs="+", default=None,
-                        help="Random seeds (overrides config)")
-    parser.add_argument("--output-dir", type=str, default=None,
-                        help="Output directory for results")
-    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--episodes_per_phase", type=int, default=None)
+    parser.add_argument("--rep_dim", type=int, default=None)
+    parser.add_argument("--lr_psi", type=float, default=None)
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--entropy_coeff", type=float, default=None)
+    parser.add_argument("--max_steps", type=int, default=None)
+    parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--clear_replay_on_transition",
+                        action="store_true", default=None)
     args = parser.parse_args()
 
-    # Load / merge config
     config = dict(DEFAULT_CONFIG)
     if args.config:
-        with open(args.config) as f:
-            config.update(json.load(f))
-    if args.seeds:
-        config["seeds"] = args.seeds
+        config = merge_configs(config, load_config(args.config))
 
-    # Output directory
-    if args.output_dir:
-        out_dir = Path(args.output_dir)
-    else:
-        out_dir = Path(__file__).parent / "results" / f"run_{int(time.time())}"
+    # CLI overrides
+    cli_overrides = {k: v for k, v in vars(args).items()
+                     if k != "config" and v is not None}
+    config = merge_configs(config, cli_overrides)
 
-    verbose = not args.quiet
-
-    if verbose:
-        print("Continual Maze SGCRL Experiment")
-        print(f"  Phases: {config['episodes_per_phase']} episodes each")
-        print(f"  Seeds: {config['seeds']}")
-        print(f"  Output: {out_dir}")
-
-    # Save config
-    out_dir.mkdir(parents=True, exist_ok=True)
-    with open(out_dir / "config.json", "w") as f:
-        json.dump(config, f, indent=2)
-
-    # Run experiments
-    all_results = []
-    for seed in config["seeds"]:
-        res = run_single_seed(config, seed, verbose=verbose)
-        all_results.append(res)
-
-    # Save
-    save_results(all_results, out_dir)
-
-    if verbose:
-        print(f"\nAll results saved to {out_dir}")
-        # Print quick summary
-        summary = _aggregate_summary(all_results)
-        print("\n--- Quick Summary ---")
-        for p, stats in summary["per_phase_train_success"].items():
-            print(f"  Phase {p} train success: "
-                  f"{stats['mean']:.3f} ± {stats['std']:.3f}")
-        for p, stats in summary["per_phase_eval_success"].items():
-            print(f"  Phase {p} eval success:  "
-                  f"{stats['mean']:.3f} ± {stats['std']:.3f}")
-        for p, stats in summary["per_phase_exploitation_ratio"].items():
-            print(f"  Phase {p} exploit ratio: "
-                  f"{stats['mean']:.3f} ± {stats['std']:.3f}")
-        for p, stats in summary["adaptation_speed"].items():
-            print(f"  Phase {p} adapt speed:   "
-                  f"{stats['mean']:.1f} ± {stats['std']:.1f} episodes")
+    run_experiment(config)
 
 
 if __name__ == "__main__":

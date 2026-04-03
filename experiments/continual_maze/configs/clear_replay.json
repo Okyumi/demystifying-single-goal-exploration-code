@@ -1,7 +1,4 @@
 {
-  "height": 10,
-  "width": 10,
-  "episodes_per_phase": 500,
   "rep_dim": 16,
   "lr_psi": 0.01,
   "batch_size": 128,
@@ -9,9 +6,11 @@
   "max_steps": 50,
   "gamma": 0.99,
   "entropy_coeff": 0.1,
-  "episodes_per_upd": 1,
-  "eval_freq": 1,
-  "norm": true,
-  "clear_replay_on_phase_change": true,
-  "seeds": [42, 123, 456]
+  "episodes_per_update": 1,
+  "normalize": true,
+  "episodes_per_phase": 500,
+  "seed": 42,
+  "eval_freq": 5,
+  "psi_snapshot_freq": 25,
+  "clear_replay_on_transition": true
 }

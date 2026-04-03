@@ -1,30 +1,24 @@
 """
-Metric computation for the continual maze experiments.
+Metrics collection for continual maze experiments.
 
-Metrics implemented:
-1. Success rate (per-phase)
-2. Path diversity (Jaccard distance, cluster count, entropy)
-3. Trajectory preference (fraction per route)
-4. Adaptation speed (steps to first success after phase change)
-5. ψ-similarity evolution (per-state similarity to goal)
-6. Representation drift (L2 and cosine at phase transitions)
-7. Exploitation ratio (fraction using dominant path)
+Tracks:
+  1. Success rate (per-phase, rolling)
+  2. Path diversity (Jaccard distance, route clustering, entropy)
+  3. Trajectory preference (fraction per dominant path)
+  4. Adaptation speed (episodes until first success after phase change)
+  5. ψ-similarity evolution (snapshots over training)
+  6. Representation drift (L2 / cosine distance across phase transitions)
+  7. Exploitation ratio (fraction using dominant path)
 """
 
-from __future__ import annotations
-
-from collections import Counter
-from typing import Dict, List, Optional, Tuple
-
 import numpy as np
+from collections import defaultdict
+from typing import List, Tuple, Dict, Any, Optional
+from dataclasses import dataclass, field
 
 
-# -----------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------
-
-def _traj_to_cell_set(traj: List[int]) -> frozenset:
-    """Convert trajectory to set of visited cells."""
+def _trajectory_to_cell_set(traj: List[int]) -> frozenset:
+    """Convert a trajectory (list of state indices) to a set of visited cells."""
     return frozenset(traj)
 
 
@@ -34,323 +28,243 @@ def _jaccard_distance(a: frozenset, b: frozenset) -> float:
     return 1.0 - len(a & b) / len(a | b)
 
 
-def _classify_route(traj: List[int], maze_shape: Tuple[int, int],
-                    goal_state: int) -> str:
-    """Classify a trajectory by the quadrant sequence it passes through.
+def _cluster_trajectories(cell_sets: List[frozenset],
+                          threshold: float = 0.5) -> List[int]:
+    """Simple single-linkage clustering of trajectories by Jaccard distance.
 
-    We label each state by its quadrant (TL, TR, BL, BR) and record the
-    sequence of *unique* quadrant transitions.  This gives a compact
-    route fingerprint.
+    Returns a cluster-id list (same length as cell_sets).
     """
-    h, w = maze_shape
-    mid_r, mid_c = h // 2, w // 2
-    labels = []
-    for s in traj:
-        r, c = np.unravel_index(s, maze_shape)
-        if r < mid_r:
-            label = "TL" if c < mid_c else "TR"
-        else:
-            label = "BL" if c < mid_c else "BR"
-        if not labels or labels[-1] != label:
-            labels.append(label)
-    return "->".join(labels)
+    n = len(cell_sets)
+    if n == 0:
+        return []
+    labels = list(range(n))
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _jaccard_distance(cell_sets[i], cell_sets[j]) < threshold:
+                # Merge clusters
+                old, new = max(labels[i], labels[j]), min(labels[i], labels[j])
+                labels = [new if l == old else l for l in labels]
+
+    # Re-index to 0..K-1
+    unique = sorted(set(labels))
+    remap = {v: k for k, v in enumerate(unique)}
+    return [remap[l] for l in labels]
 
 
-# -----------------------------------------------------------------------
-# 1. Success rate
-# -----------------------------------------------------------------------
+class MetricsCollector:
+    """Collects and stores all experiment metrics.
 
-def compute_success_rate(
-    successes: List[int],
-    phase_at_episode: List[int],
-) -> Dict:
-    """Per-phase and overall success rate."""
-    successes = np.array(successes)
-    phases = np.array(phase_at_episode)
+    Call the `record_*` methods during training; call `finalise()` at the end
+    to compute aggregate statistics.
+    """
 
-    overall = float(successes.mean()) if len(successes) > 0 else 0.0
-    per_phase = {}
-    for p in np.unique(phases):
-        mask = phases == p
-        per_phase[int(p)] = float(successes[mask].mean())
+    def __init__(self, num_states: int, maze_shape: Tuple[int, int]):
+        self.num_states = num_states
+        self.maze_shape = maze_shape
 
-    return {"overall": overall, "per_phase": per_phase}
+        # Per-episode tracking
+        self.episode_success: List[bool] = []
+        self.episode_phase: List[int] = []
+        self.episode_trajectories: List[List[int]] = []
 
+        # ψ-similarity snapshots: list of (episode, phase, similarity_map)
+        self.psi_snapshots: List[Tuple[int, int, np.ndarray]] = []
 
-# -----------------------------------------------------------------------
-# 2. Path diversity
-# -----------------------------------------------------------------------
+        # ψ full embedding snapshots at phase transitions
+        # list of (phase_idx, direction, psi_copy)
+        # direction: "before" or "after"
+        self.psi_transition_snapshots: List[Tuple[int, str, np.ndarray]] = []
 
-def compute_path_diversity(
-    trajectories: List[List[int]],
-    successes: List[int],
-    phase_at_episode: List[int],
-    maze_shape: Tuple[int, int],
-    goal_state: int,
-) -> Dict:
-    """Compute Jaccard-based path diversity for successful trajectories."""
-    successes = np.array(successes)
-    phases = np.array(phase_at_episode)
-    n = len(trajectories)
+        # Phase transition episodes (for adaptation speed)
+        self.phase_transition_episodes: List[int] = []
 
-    result: Dict = {"per_phase": {}}
+    # ------------------------------------------------------------------
+    # Recording methods (called during training)
+    # ------------------------------------------------------------------
 
-    for p in np.unique(phases):
-        mask = (phases == p) & (successes == 1)
-        idxs = np.where(mask)[0]
-        if len(idxs) < 2:
-            result["per_phase"][int(p)] = {
-                "mean_jaccard": 0.0,
-                "num_distinct_routes": int(len(idxs)),
-                "route_entropy": 0.0,
+    def record_episode(self, episode: int, phase_idx: int,
+                       trajectory: List[int], success: bool):
+        self.episode_success.append(success)
+        self.episode_phase.append(phase_idx)
+        self.episode_trajectories.append(trajectory)
+
+    def record_psi_snapshot(self, episode: int, phase_idx: int,
+                            similarity_map: np.ndarray):
+        self.psi_snapshots.append((episode, phase_idx, similarity_map.copy()))
+
+    def record_phase_transition(self, episode: int, psi_before: np.ndarray,
+                                psi_after: np.ndarray, phase_idx: int):
+        self.phase_transition_episodes.append(episode)
+        self.psi_transition_snapshots.append((phase_idx, "before", psi_before.copy()))
+        self.psi_transition_snapshots.append((phase_idx, "after", psi_after.copy()))
+
+    # ------------------------------------------------------------------
+    # Computed metrics
+    # ------------------------------------------------------------------
+
+    def success_rate_per_phase(self) -> Dict[int, float]:
+        """Mean success rate for each phase."""
+        phase_successes: Dict[int, List[bool]] = defaultdict(list)
+        for p, s in zip(self.episode_phase, self.episode_success):
+            phase_successes[p].append(s)
+        return {p: float(np.mean(v)) for p, v in sorted(phase_successes.items())}
+
+    def rolling_success_rate(self, window: int = 50) -> np.ndarray:
+        """Smoothed success rate curve."""
+        arr = np.array(self.episode_success, dtype=float)
+        if len(arr) < window:
+            return np.cumsum(arr) / (np.arange(len(arr)) + 1)
+        kernel = np.ones(window) / window
+        return np.convolve(arr, kernel, mode="same")
+
+    def path_diversity_per_phase(self, cluster_threshold: float = 0.5
+                                 ) -> Dict[int, Dict[str, float]]:
+        """Per-phase path diversity metrics for *successful* trajectories."""
+        phase_trajs: Dict[int, List[List[int]]] = defaultdict(list)
+        for p, traj, succ in zip(self.episode_phase,
+                                 self.episode_trajectories,
+                                 self.episode_success):
+            if succ:
+                phase_trajs[p].append(traj)
+
+        results = {}
+        for p, trajs in sorted(phase_trajs.items()):
+            if len(trajs) < 2:
+                results[p] = {
+                    "mean_jaccard": 0.0,
+                    "num_clusters": 1 if trajs else 0,
+                    "entropy": 0.0,
+                    "num_successful": len(trajs),
+                }
+                continue
+
+            cell_sets = [_trajectory_to_cell_set(t) for t in trajs]
+
+            # Mean pairwise Jaccard distance
+            n = len(cell_sets)
+            dists = []
+            for i in range(n):
+                for j in range(i + 1, n):
+                    dists.append(_jaccard_distance(cell_sets[i], cell_sets[j]))
+            mean_jaccard = float(np.mean(dists)) if dists else 0.0
+
+            # Clustering
+            labels = _cluster_trajectories(cell_sets, cluster_threshold)
+            num_clusters = len(set(labels))
+
+            # Entropy over cluster distribution
+            counts = np.bincount(labels)
+            probs = counts / counts.sum()
+            entropy = float(-np.sum(probs * np.log(probs + 1e-12)))
+
+            results[p] = {
+                "mean_jaccard": mean_jaccard,
+                "num_clusters": num_clusters,
+                "entropy": entropy,
+                "num_successful": len(trajs),
             }
-            continue
+        return results
 
-        # Cell-set representation
-        cell_sets = [_traj_to_cell_set(trajectories[i]) for i in idxs]
+    def trajectory_preference(self, cluster_threshold: float = 0.5
+                              ) -> Dict[int, Dict[str, Any]]:
+        """Per-phase: fraction of successful episodes using each route cluster."""
+        phase_trajs: Dict[int, List[List[int]]] = defaultdict(list)
+        for p, traj, succ in zip(self.episode_phase,
+                                 self.episode_trajectories,
+                                 self.episode_success):
+            if succ:
+                phase_trajs[p].append(traj)
 
-        # Mean pairwise Jaccard distance
-        dists = []
-        for i in range(len(cell_sets)):
-            for j in range(i + 1, len(cell_sets)):
-                dists.append(_jaccard_distance(cell_sets[i], cell_sets[j]))
-        mean_jacc = float(np.mean(dists)) if dists else 0.0
+        results = {}
+        for p, trajs in sorted(phase_trajs.items()):
+            if not trajs:
+                results[p] = {"cluster_fractions": [], "dominant_fraction": 0.0}
+                continue
+            cell_sets = [_trajectory_to_cell_set(t) for t in trajs]
+            labels = _cluster_trajectories(cell_sets, cluster_threshold)
+            counts = np.bincount(labels)
+            fracs = (counts / counts.sum()).tolist()
+            results[p] = {
+                "cluster_fractions": fracs,
+                "dominant_fraction": float(max(fracs)),
+            }
+        return results
 
-        # Route classification and entropy
-        routes = [_classify_route(trajectories[i], maze_shape, goal_state)
-                  for i in idxs]
-        counter = Counter(routes)
-        total = sum(counter.values())
-        probs = np.array([c / total for c in counter.values()])
-        entropy = float(-np.sum(probs * np.log(probs + 1e-12)))
+    def adaptation_speed(self) -> Dict[int, Optional[int]]:
+        """Episodes from phase transition to first success, per phase."""
+        results = {}
+        transitions = [0] + self.phase_transition_episodes
+        for idx, start_ep in enumerate(transitions):
+            end_ep = (transitions[idx + 1] if idx + 1 < len(transitions)
+                      else len(self.episode_success))
+            first_success = None
+            for ep in range(start_ep, end_ep):
+                if ep < len(self.episode_success) and self.episode_success[ep]:
+                    first_success = ep - start_ep
+                    break
+            results[idx] = first_success
+        return results
 
-        result["per_phase"][int(p)] = {
-            "mean_jaccard": mean_jacc,
-            "num_distinct_routes": len(counter),
-            "route_entropy": entropy,
-            "route_counts": dict(counter),
-        }
-
-    return result
-
-
-# -----------------------------------------------------------------------
-# 3. Trajectory preference
-# -----------------------------------------------------------------------
-
-def compute_trajectory_preference(
-    trajectories: List[List[int]],
-    successes: List[int],
-    phase_at_episode: List[int],
-    maze_shape: Tuple[int, int],
-    goal_state: int,
-) -> Dict:
-    """Fraction of successful episodes using each route, per phase."""
-    successes = np.array(successes)
-    phases = np.array(phase_at_episode)
-    result: Dict = {"per_phase": {}}
-
-    for p in np.unique(phases):
-        mask = (phases == p) & (successes == 1)
-        idxs = np.where(mask)[0]
-        if len(idxs) == 0:
-            result["per_phase"][int(p)] = {}
-            continue
-        routes = [_classify_route(trajectories[i], maze_shape, goal_state)
-                  for i in idxs]
-        counter = Counter(routes)
-        total = sum(counter.values())
-        fracs = {r: c / total for r, c in counter.items()}
-        result["per_phase"][int(p)] = fracs
-
-    return result
-
-
-# -----------------------------------------------------------------------
-# 4. Adaptation speed
-# -----------------------------------------------------------------------
-
-def compute_adaptation_speed(
-    successes: List[int],
-    phase_log: List[Tuple[int, int]],
-) -> Dict:
-    """Episodes from phase transition to first success."""
-    result = {}
-    for transition_ep, phase_idx in phase_log:
-        if phase_idx == 0:
-            continue  # skip initial phase
-        first_success = None
-        for ep_offset in range(len(successes) - transition_ep):
-            ep = transition_ep + ep_offset
-            if ep >= len(successes):
-                break
-            if successes[ep]:
-                first_success = ep_offset
-                break
-        result[int(phase_idx)] = {
-            "transition_episode": int(transition_ep),
-            "episodes_to_first_success": first_success,
-        }
-    return result
-
-
-# -----------------------------------------------------------------------
-# 5. ψ-similarity evolution
-# -----------------------------------------------------------------------
-
-def compute_psi_similarity_snapshots(
-    psi_snapshots: List[Tuple[int, int, np.ndarray]],
-    goal_state: int,
-    maze_shape: Tuple[int, int],
-) -> Dict:
-    """Compute per-state ψ(s)·ψ(g) similarity at each snapshot.
-
-    Also computes mean similarity per quadrant.
-    """
-    h, w = maze_shape
-    mid_r, mid_c = h // 2, w // 2
-    n_states = h * w
-
-    snapshots = []
-    for episode, phase_idx, psi in psi_snapshots:
-        goal_vec = psi[goal_state]
-        sims = psi @ goal_vec  # (n_states,)
-
-        # Per-quadrant means
-        quad_sims = {"TL": [], "TR": [], "BL": [], "BR": []}
-        for s in range(n_states):
-            r, c = np.unravel_index(s, maze_shape)
-            if r < mid_r:
-                q = "TL" if c < mid_c else "TR"
+    def representation_drift(self) -> List[Dict[str, Any]]:
+        """L2 and cosine drift of ψ across each phase transition."""
+        results = []
+        # Pair up (before, after) for each transition
+        before_map: Dict[int, np.ndarray] = {}
+        after_map: Dict[int, np.ndarray] = {}
+        for phase_idx, direction, psi in self.psi_transition_snapshots:
+            if direction == "before":
+                before_map[phase_idx] = psi
             else:
-                q = "BL" if c < mid_c else "BR"
-            quad_sims[q].append(sims[s])
+                after_map[phase_idx] = psi
 
-        quad_means = {q: float(np.mean(v)) if v else 0.0
-                      for q, v in quad_sims.items()}
+        for phase_idx in sorted(set(before_map) & set(after_map)):
+            psi_b = before_map[phase_idx]
+            psi_a = after_map[phase_idx]
+            # Mean L2 distance
+            l2 = float(np.mean(np.linalg.norm(psi_a - psi_b, axis=1)))
+            # Mean cosine similarity
+            dots = np.sum(psi_a * psi_b, axis=1)
+            norms = (np.linalg.norm(psi_a, axis=1) *
+                     np.linalg.norm(psi_b, axis=1) + 1e-12)
+            cos_sim = float(np.mean(dots / norms))
+            results.append({
+                "phase_idx": phase_idx,
+                "mean_l2_distance": l2,
+                "mean_cosine_similarity": cos_sim,
+            })
+        return results
 
-        snapshots.append({
-            "episode": int(episode),
-            "phase_idx": int(phase_idx),
-            "similarity_map": sims.tolist(),
-            "quadrant_means": quad_means,
-        })
+    def exploitation_ratio(self, cluster_threshold: float = 0.5
+                           ) -> Dict[int, float]:
+        """Per-phase fraction of successful episodes using the dominant path."""
+        prefs = self.trajectory_preference(cluster_threshold)
+        return {p: v["dominant_fraction"] for p, v in prefs.items()}
 
-    return {"snapshots": snapshots}
+    # ------------------------------------------------------------------
+    # Serialisation
+    # ------------------------------------------------------------------
 
-
-# -----------------------------------------------------------------------
-# 6. Representation drift
-# -----------------------------------------------------------------------
-
-def compute_representation_drift(
-    phase_snapshots,  # List[PhaseSnapshot]
-) -> Dict:
-    """L2 and cosine drift of ψ at phase transitions."""
-    result = {}
-    for i in range(1, len(phase_snapshots)):
-        prev = phase_snapshots[i - 1]
-        curr = phase_snapshots[i]
-
-        psi_prev = prev.psi
-        psi_curr = curr.psi
-
-        # Mean L2 distance per state
-        l2 = np.linalg.norm(psi_curr - psi_prev, axis=1)
-        mean_l2 = float(l2.mean())
-
-        # Mean cosine similarity per state
-        dots = np.sum(psi_curr * psi_prev, axis=1)
-        norm_prev = np.linalg.norm(psi_prev, axis=1) + 1e-8
-        norm_curr = np.linalg.norm(psi_curr, axis=1) + 1e-8
-        cosines = dots / (norm_prev * norm_curr)
-        mean_cos = float(cosines.mean())
-
-        result[int(curr.phase_idx)] = {
-            "from_episode": int(prev.episode),
-            "to_episode": int(curr.episode),
-            "mean_l2_drift": mean_l2,
-            "mean_cosine_similarity": mean_cos,
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialise all computed metrics to a JSON-friendly dict."""
+        return {
+            "success_rate_per_phase": self.success_rate_per_phase(),
+            "rolling_success_rate": self.rolling_success_rate().tolist(),
+            "path_diversity_per_phase": self.path_diversity_per_phase(),
+            "trajectory_preference": {
+                str(k): v for k, v in self.trajectory_preference().items()
+            },
+            "adaptation_speed": {
+                str(k): v for k, v in self.adaptation_speed().items()
+            },
+            "representation_drift": self.representation_drift(),
+            "exploitation_ratio": {
+                str(k): v for k, v in self.exploitation_ratio().items()
+            },
+            "psi_snapshots": [
+                {"episode": ep, "phase": ph, "similarity_map": sm.tolist()}
+                for ep, ph, sm in self.psi_snapshots
+            ],
+            "total_episodes": len(self.episode_success),
+            "phase_transition_episodes": self.phase_transition_episodes,
         }
-
-    return result
-
-
-# -----------------------------------------------------------------------
-# 7. Exploitation ratio
-# -----------------------------------------------------------------------
-
-def compute_exploitation_ratio(
-    trajectories: List[List[int]],
-    successes: List[int],
-    phase_at_episode: List[int],
-    maze_shape: Tuple[int, int],
-    goal_state: int,
-) -> Dict:
-    """Fraction of successful episodes using the dominant route."""
-    successes = np.array(successes)
-    phases = np.array(phase_at_episode)
-    result: Dict = {"per_phase": {}}
-
-    for p in np.unique(phases):
-        mask = (phases == p) & (successes == 1)
-        idxs = np.where(mask)[0]
-        if len(idxs) == 0:
-            result["per_phase"][int(p)] = {
-                "exploitation_ratio": 0.0,
-                "dominant_route": None,
-            }
-            continue
-        routes = [_classify_route(trajectories[i], maze_shape, goal_state)
-                  for i in idxs]
-        counter = Counter(routes)
-        dominant_route, dominant_count = counter.most_common(1)[0]
-        ratio = dominant_count / len(idxs)
-        result["per_phase"][int(p)] = {
-            "exploitation_ratio": float(ratio),
-            "dominant_route": dominant_route,
-            "total_successful": int(len(idxs)),
-        }
-
-    return result
-
-
-# -----------------------------------------------------------------------
-# Aggregate
-# -----------------------------------------------------------------------
-
-def compute_all_metrics(
-    results: Dict,
-    maze_shape: Tuple[int, int],
-    goal_state: int,
-) -> Dict:
-    """Compute all metrics from a training results dict."""
-    train_succ = results["train_successes"]
-    eval_succ = results["eval_successes"]
-    train_traj = results["train_trajectories"]
-    eval_traj = results["eval_trajectories"]
-    phase_at_ep = results["phase_at_episode"]
-    phase_log = results["phase_log"]
-    psi_snaps = results["psi_snapshots"]
-    phase_snaps = results["phase_snapshots"]
-
-    # Use eval trajectories for path metrics (greedy policy)
-    # But we need eval_phase_at_episode aligned with eval indices
-    eval_phases = phase_at_ep[::1]  # eval_freq=1 means same length
-    # Trim to match eval length
-    eval_phases = eval_phases[:len(eval_succ)]
-
-    return {
-        "success_rate": compute_success_rate(train_succ, phase_at_ep),
-        "eval_success_rate": compute_success_rate(eval_succ, eval_phases),
-        "path_diversity": compute_path_diversity(
-            eval_traj, eval_succ, eval_phases, maze_shape, goal_state),
-        "trajectory_preference": compute_trajectory_preference(
-            eval_traj, eval_succ, eval_phases, maze_shape, goal_state),
-        "adaptation_speed": compute_adaptation_speed(train_succ, phase_log),
-        "psi_similarity": compute_psi_similarity_snapshots(
-            psi_snaps, goal_state, maze_shape),
-        "representation_drift": compute_representation_drift(phase_snaps),
-        "exploitation_ratio": compute_exploitation_ratio(
-            eval_traj, eval_succ, eval_phases, maze_shape, goal_state),
-    }

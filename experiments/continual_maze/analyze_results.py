@@ -1,320 +1,245 @@
 #!/usr/bin/env python3
 """
-Analysis and visualization for continual maze experiment results.
+Analyse and visualise results from a continual maze experiment.
 
 Usage:
-    python experiments/continual_maze/analyze_results.py results/run_XXX/
-    python experiments/continual_maze/analyze_results.py results/run_XXX/ --no-show
+    python experiments/continual_maze/analyze_results.py results/seed_42
+    python experiments/continual_maze/analyze_results.py results/seed_42 --no-show
 """
-
-from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
-from pathlib import Path
-from typing import Dict, List
-
 import numpy as np
+from pathlib import Path
 
+# Optional: matplotlib may not be installed in headless environments
 try:
     import matplotlib
-    matplotlib.use("Agg")  # non-interactive backend
+    matplotlib.use("Agg")  # non-interactive backend by default
     import matplotlib.pyplot as plt
     from matplotlib.gridspec import GridSpec
     HAS_MPL = True
 except ImportError:
     HAS_MPL = False
-    print("WARNING: matplotlib not found; plots will be skipped.")
 
 
-# -----------------------------------------------------------------------
-# Loaders
-# -----------------------------------------------------------------------
-
-def load_results(results_dir: Path) -> Dict:
-    """Load summary, per-seed metrics, and psi snapshots."""
-    with open(results_dir / "summary.json") as f:
-        summary = json.load(f)
-
-    per_seed = []
-    for p in sorted(results_dir.glob("metrics_seed_*.json")):
-        with open(p) as f:
-            per_seed.append(json.load(f))
-
-    psi_snapshots = {}
-    for p in sorted(results_dir.glob("psi_snapshots_seed_*.npz")):
-        seed = int(p.stem.split("_")[-1])
-        data = np.load(p)
-        psi_snapshots[seed] = {
-            "similarity_maps": data["similarity_maps"],
-            "episodes": data["episodes"],
-            "phases": data["phases"],
-        }
-
-    return {
-        "summary": summary,
-        "per_seed": per_seed,
-        "psi_snapshots": psi_snapshots,
-    }
+def load_results(result_dir: str):
+    with open(os.path.join(result_dir, "metrics.json")) as f:
+        metrics = json.load(f)
+    with open(os.path.join(result_dir, "config.json")) as f:
+        config = json.load(f)
+    env_config_path = os.path.join(result_dir, "env_config.json")
+    env_config = None
+    if os.path.exists(env_config_path):
+        with open(env_config_path) as f:
+            env_config = json.load(f)
+    return metrics, config, env_config
 
 
-# -----------------------------------------------------------------------
-# Plots
-# -----------------------------------------------------------------------
-
-def plot_success_rate(per_seed: List[Dict], config: Dict,
-                      out_dir: Path):
-    """Plot per-phase success rate over episodes (smoothed)."""
-    if not HAS_MPL:
-        return
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-    window = 50
-    epp = config["episodes_per_phase"]
-
-    for ax, key, title in [
-        (axes[0], "success_rate", "Training Success Rate"),
-        (axes[1], "eval_success_rate", "Evaluation Success Rate"),
-    ]:
-        for seed_data in per_seed:
-            seed = seed_data["seed"]
-            per_phase = seed_data["metrics"][key]["per_phase"]
-
-            # We don't have per-episode data in saved metrics,
-            # but we have per-phase averages — plot as bars
-            phases = sorted(per_phase.keys(), key=int)
-            vals = [per_phase[p] for p in phases]
-            x = [int(p) for p in phases]
-            ax.bar([xi + 0.15 * per_seed.index(seed_data) for xi in x],
-                   vals, width=0.15, label=f"seed {seed}", alpha=0.8)
-
-        ax.set_xlabel("Phase")
-        ax.set_ylabel("Success Rate")
-        ax.set_title(title)
-        ax.set_xticks(range(len(phases)))
-        ax.set_xticklabels([f"Phase {p}" for p in phases])
-        ax.legend()
-        ax.grid(axis="y", alpha=0.3)
-
-    plt.tight_layout()
-    fig.savefig(out_dir / "success_rate.png", dpi=150)
-    plt.close(fig)
-    print(f"  Saved {out_dir / 'success_rate.png'}")
-
-
-def plot_exploitation_ratio(per_seed: List[Dict], out_dir: Path):
-    """Plot exploitation ratio per phase."""
-    if not HAS_MPL:
-        return
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-
-    for seed_data in per_seed:
-        seed = seed_data["seed"]
-        exploit = seed_data["metrics"]["exploitation_ratio"]["per_phase"]
-        phases = sorted(exploit.keys(), key=int)
-        vals = [exploit[p]["exploitation_ratio"] for p in phases]
-        ax.plot([int(p) for p in phases], vals, "o-",
-                label=f"seed {seed}", markersize=8)
-
-    ax.set_xlabel("Phase")
-    ax.set_ylabel("Exploitation Ratio")
-    ax.set_title("Exploitation Ratio per Phase\n"
-                 "(fraction of successful episodes using dominant route)")
-    ax.legend()
-    ax.grid(alpha=0.3)
-    ax.set_ylim(0, 1.05)
-
-    plt.tight_layout()
-    fig.savefig(out_dir / "exploitation_ratio.png", dpi=150)
-    plt.close(fig)
-    print(f"  Saved {out_dir / 'exploitation_ratio.png'}")
-
-
-def plot_path_diversity(per_seed: List[Dict], out_dir: Path):
-    """Plot path diversity metrics per phase."""
-    if not HAS_MPL:
-        return
-
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-
-    for seed_data in per_seed:
-        seed = seed_data["seed"]
-        div = seed_data["metrics"]["path_diversity"]["per_phase"]
-        phases = sorted(div.keys(), key=int)
-
-        jacc = [div[p]["mean_jaccard"] for p in phases]
-        routes = [div[p]["num_distinct_routes"] for p in phases]
-        ent = [div[p]["route_entropy"] for p in phases]
-
-        x = [int(p) for p in phases]
-        axes[0].plot(x, jacc, "o-", label=f"seed {seed}")
-        axes[1].plot(x, routes, "o-", label=f"seed {seed}")
-        axes[2].plot(x, ent, "o-", label=f"seed {seed}")
-
-    axes[0].set_title("Mean Pairwise Jaccard Distance")
-    axes[1].set_title("Number of Distinct Routes")
-    axes[2].set_title("Route Entropy")
-
-    for ax in axes:
-        ax.set_xlabel("Phase")
-        ax.legend()
-        ax.grid(alpha=0.3)
-
-    plt.tight_layout()
-    fig.savefig(out_dir / "path_diversity.png", dpi=150)
-    plt.close(fig)
-    print(f"  Saved {out_dir / 'path_diversity.png'}")
-
-
-def plot_psi_similarity_evolution(psi_snapshots: Dict, config: Dict,
-                                  out_dir: Path):
-    """Plot ψ-similarity heatmaps at key training moments."""
-    if not HAS_MPL:
-        return
-
-    h, w = config["height"], config["width"]
-
-    for seed, data in psi_snapshots.items():
-        sim_maps = data["similarity_maps"]
-        episodes = data["episodes"]
-        phases = data["phases"]
-
-        # Select up to 8 snapshots spread across training
-        n_snaps = len(episodes)
-        if n_snaps <= 8:
-            idxs = list(range(n_snaps))
-        else:
-            idxs = np.linspace(0, n_snaps - 1, 8, dtype=int).tolist()
-
-        n_plots = len(idxs)
-        fig, axes = plt.subplots(1, n_plots, figsize=(3 * n_plots, 3))
-        if n_plots == 1:
-            axes = [axes]
-
-        for ax_i, snap_i in enumerate(idxs):
-            sim = sim_maps[snap_i].reshape(h, w)
-            ep = episodes[snap_i]
-            ph = phases[snap_i]
-
-            im = axes[ax_i].imshow(sim, cmap="viridis", origin="lower",
-                                   vmin=-0.5, vmax=1.0)
-            axes[ax_i].set_title(f"Ep {ep}\nPhase {ph}", fontsize=9)
-            axes[ax_i].set_xticks([])
-            axes[ax_i].set_yticks([])
-
-        fig.suptitle(f"ψ-Similarity Evolution (seed {seed})", fontsize=13)
-        fig.colorbar(im, ax=axes, shrink=0.8, label="ψ(s)·ψ(g)")
-        plt.tight_layout()
-        fig.savefig(out_dir / f"psi_evolution_seed_{seed}.png", dpi=150)
-        plt.close(fig)
-        print(f"  Saved {out_dir / f'psi_evolution_seed_{seed}.png'}")
-
-
-def plot_representation_drift(per_seed: List[Dict], out_dir: Path):
-    """Plot representation drift at phase transitions."""
-    if not HAS_MPL:
-        return
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-
-    for seed_data in per_seed:
-        seed = seed_data["seed"]
-        drift = seed_data["metrics"]["representation_drift"]
-        if not drift:
-            continue
-        phases = sorted(drift.keys(), key=int)
-        l2 = [drift[p]["mean_l2_drift"] for p in phases]
-        cos = [drift[p]["mean_cosine_similarity"] for p in phases]
-
-        x = [int(p) for p in phases]
-        axes[0].plot(x, l2, "o-", label=f"seed {seed}")
-        axes[1].plot(x, cos, "o-", label=f"seed {seed}")
-
-    axes[0].set_title("Mean L2 Drift at Phase Transitions")
-    axes[0].set_ylabel("Mean L2 Distance")
-    axes[1].set_title("Mean Cosine Similarity at Phase Transitions")
-    axes[1].set_ylabel("Cosine Similarity")
-
-    for ax in axes:
-        ax.set_xlabel("Phase")
-        ax.legend()
-        ax.grid(alpha=0.3)
-
-    plt.tight_layout()
-    fig.savefig(out_dir / "representation_drift.png", dpi=150)
-    plt.close(fig)
-    print(f"  Saved {out_dir / 'representation_drift.png'}")
-
-
-def print_summary(summary: Dict):
-    """Print a textual summary of results."""
-    print("\n" + "=" * 60)
-    print("  EXPERIMENT SUMMARY")
+def print_summary(metrics: dict, config: dict, env_config: dict | None):
+    print("=" * 60)
+    print("CONTINUAL MAZE EXPERIMENT — RESULTS SUMMARY")
     print("=" * 60)
 
-    print(f"\nSeeds: {summary['seeds']}")
-    epp = summary["config"]["episodes_per_phase"]
-    print(f"Episodes per phase: {epp}")
+    print(f"\nSeed: {config.get('seed')}")
+    print(f"Total episodes: {metrics['total_episodes']}")
+    if env_config:
+        phase_names = [p["name"] for p in env_config["phases"]]
+        print(f"Phases: {phase_names}")
+    print(f"Phase transitions at episodes: "
+          f"{metrics['phase_transition_episodes']}")
 
-    print("\nPer-Phase Training Success Rate:")
-    for p, s in summary["per_phase_train_success"].items():
-        print(f"  Phase {p}: {s['mean']:.3f} ± {s['std']:.3f} "
-              f"(min={s['min']:.3f}, max={s['max']:.3f})")
+    # Success rate per phase
+    print("\n--- Success Rate per Phase ---")
+    sr = metrics["success_rate_per_phase"]
+    for p, rate in sorted(sr.items(), key=lambda x: int(x[0])):
+        print(f"  Phase {p}: {rate:.3f}")
 
-    print("\nPer-Phase Evaluation Success Rate:")
-    for p, s in summary["per_phase_eval_success"].items():
-        print(f"  Phase {p}: {s['mean']:.3f} ± {s['std']:.3f}")
+    # Adaptation speed
+    print("\n--- Adaptation Speed (episodes to first success) ---")
+    adapt = metrics["adaptation_speed"]
+    for p, speed in sorted(adapt.items(), key=lambda x: int(x[0])):
+        print(f"  Phase {p}: {speed}")
 
-    print("\nExploitation Ratio:")
-    for p, s in summary["per_phase_exploitation_ratio"].items():
-        print(f"  Phase {p}: {s['mean']:.3f} ± {s['std']:.3f}")
+    # Path diversity
+    print("\n--- Path Diversity (successful trajectories) ---")
+    pd = metrics["path_diversity_per_phase"]
+    for p, info in sorted(pd.items(), key=lambda x: int(x[0])):
+        print(f"  Phase {p}: jaccard={info['mean_jaccard']:.3f}  "
+              f"clusters={info['num_clusters']}  "
+              f"entropy={info['entropy']:.3f}  "
+              f"n_success={info['num_successful']}")
 
-    print("\nAdaptation Speed (episodes to first success after transition):")
-    for p, s in summary["adaptation_speed"].items():
-        mean_str = f"{s['mean']:.1f}" if s["mean"] >= 0 else "never"
-        print(f"  Phase {p}: {mean_str} ± {s['std']:.1f}")
+    # Exploitation ratio
+    print("\n--- Exploitation Ratio (dominant path fraction) ---")
+    er = metrics["exploitation_ratio"]
+    for p, ratio in sorted(er.items(), key=lambda x: int(x[0])):
+        print(f"  Phase {p}: {ratio:.3f}")
+
+    # Representation drift
+    print("\n--- Representation Drift (at phase transitions) ---")
+    for d in metrics["representation_drift"]:
+        print(f"  Phase {d['phase_idx']} transition: "
+              f"L2={d['mean_l2_distance']:.4f}  "
+              f"cos_sim={d['mean_cosine_similarity']:.4f}")
 
 
-# -----------------------------------------------------------------------
-# CLI
-# -----------------------------------------------------------------------
+def plot_results(metrics: dict, config: dict, env_config: dict | None,
+                 output_dir: str, show: bool = False):
+    if not HAS_MPL:
+        print("matplotlib not available — skipping plots")
+        return
+
+    fig_dir = os.path.join(output_dir, "figures")
+    os.makedirs(fig_dir, exist_ok=True)
+
+    transitions = metrics["phase_transition_episodes"]
+    phase_names = []
+    if env_config:
+        phase_names = [p["name"] for p in env_config["phases"]]
+
+    # ---- 1. Rolling success rate ----
+    fig, ax = plt.subplots(figsize=(10, 4))
+    rolling = np.array(metrics["rolling_success_rate"])
+    ax.plot(rolling, linewidth=1.5, color="steelblue")
+    for t in transitions:
+        ax.axvline(t, color="red", linestyle="--", alpha=0.6, linewidth=1)
+    ax.set_xlabel("Episode")
+    ax.set_ylabel("Success Rate (rolling)")
+    ax.set_title("Success Rate Over Training")
+    ax.set_ylim(-0.05, 1.05)
+    ax.grid(True, alpha=0.3)
+
+    # Add phase labels
+    boundaries = [0] + transitions + [len(rolling)]
+    for i in range(len(boundaries) - 1):
+        mid = (boundaries[i] + boundaries[i + 1]) / 2
+        label = phase_names[i] if i < len(phase_names) else f"Phase {i}"
+        ax.text(mid, 1.02, label, ha="center", va="bottom", fontsize=9,
+                transform=ax.get_xaxis_transform())
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(fig_dir, "success_rate.png"), dpi=150)
+    if show:
+        plt.show()
+    plt.close(fig)
+
+    # ---- 2. ψ-similarity heatmaps ----
+    snapshots = metrics.get("psi_snapshots", [])
+    if snapshots:
+        # Pick up to 12 evenly spaced snapshots
+        n = len(snapshots)
+        indices = np.linspace(0, n - 1, min(n, 12), dtype=int)
+        ncols = 4
+        nrows = int(np.ceil(len(indices) / ncols))
+        fig, axes = plt.subplots(nrows, ncols,
+                                 figsize=(3.5 * ncols, 3.2 * nrows))
+        axes = np.atleast_2d(axes)
+        for idx, ax in enumerate(axes.flat):
+            if idx >= len(indices):
+                ax.axis("off")
+                continue
+            snap = snapshots[indices[idx]]
+            ep = snap["episode"]
+            phase = snap["phase"]
+            sim_map = np.array(snap["similarity_map"])
+            im = ax.imshow(sim_map, cmap="viridis", origin="lower",
+                           vmin=min(0, sim_map.min()), vmax=1)
+            label = phase_names[phase] if phase < len(phase_names) else f"P{phase}"
+            ax.set_title(f"Ep {ep} ({label})", fontsize=9)
+            ax.set_xticks([])
+            ax.set_yticks([])
+        fig.suptitle("ψ(s)·ψ(g) Similarity Over Training", fontsize=12)
+        fig.tight_layout()
+        fig.savefig(os.path.join(fig_dir, "psi_similarity_evolution.png"),
+                    dpi=150)
+        if show:
+            plt.show()
+        plt.close(fig)
+
+    # ---- 3. Path diversity bar chart ----
+    pd = metrics["path_diversity_per_phase"]
+    if pd:
+        phases_k = sorted(pd.keys(), key=int)
+        fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+
+        labels = [phase_names[int(k)] if int(k) < len(phase_names) else f"P{k}"
+                  for k in phases_k]
+        x = np.arange(len(phases_k))
+
+        # Jaccard
+        vals = [pd[k]["mean_jaccard"] for k in phases_k]
+        axes[0].bar(x, vals, color="teal")
+        axes[0].set_xticks(x)
+        axes[0].set_xticklabels(labels, rotation=30)
+        axes[0].set_ylabel("Mean Jaccard Distance")
+        axes[0].set_title("Path Diversity (Jaccard)")
+
+        # Clusters
+        vals = [pd[k]["num_clusters"] for k in phases_k]
+        axes[1].bar(x, vals, color="coral")
+        axes[1].set_xticks(x)
+        axes[1].set_xticklabels(labels, rotation=30)
+        axes[1].set_ylabel("# Route Clusters")
+        axes[1].set_title("Route Clusters")
+
+        # Entropy
+        vals = [pd[k]["entropy"] for k in phases_k]
+        axes[2].bar(x, vals, color="mediumpurple")
+        axes[2].set_xticks(x)
+        axes[2].set_xticklabels(labels, rotation=30)
+        axes[2].set_ylabel("Shannon Entropy")
+        axes[2].set_title("Route Distribution Entropy")
+
+        fig.suptitle("Path Diversity Metrics", fontsize=12)
+        fig.tight_layout()
+        fig.savefig(os.path.join(fig_dir, "path_diversity.png"), dpi=150)
+        if show:
+            plt.show()
+        plt.close(fig)
+
+    # ---- 4. Exploitation ratio ----
+    er = metrics["exploitation_ratio"]
+    if er:
+        phases_k = sorted(er.keys(), key=int)
+        labels = [phase_names[int(k)] if int(k) < len(phase_names) else f"P{k}"
+                  for k in phases_k]
+        vals = [er[k] for k in phases_k]
+
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.bar(range(len(vals)), vals, color="darkorange")
+        ax.set_xticks(range(len(vals)))
+        ax.set_xticklabels(labels, rotation=30)
+        ax.set_ylabel("Exploitation Ratio")
+        ax.set_title("Dominant Path Usage per Phase")
+        ax.set_ylim(0, 1.05)
+        ax.grid(True, alpha=0.3, axis="y")
+        fig.tight_layout()
+        fig.savefig(os.path.join(fig_dir, "exploitation_ratio.png"), dpi=150)
+        if show:
+            plt.show()
+        plt.close(fig)
+
+    print(f"Figures saved to {fig_dir}")
+
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Analyze continual maze experiment results")
-    parser.add_argument("results_dir", type=str,
-                        help="Path to results directory")
+        description="Analyse continual maze experiment results")
+    parser.add_argument("result_dir", type=str,
+                        help="Path to results directory (e.g. results/seed_42)")
+    parser.add_argument("--show", action="store_true",
+                        help="Display plots interactively")
     parser.add_argument("--no-show", action="store_true",
-                        help="Don't try to display plots (save only)")
+                        help="Suppress interactive display (default)")
     args = parser.parse_args()
 
-    results_dir = Path(args.results_dir)
-    if not results_dir.exists():
-        print(f"ERROR: {results_dir} does not exist")
-        sys.exit(1)
-
-    data = load_results(results_dir)
-    config = data["summary"]["config"]
-    per_seed = data["per_seed"]
-
-    # Print summary
-    print_summary(data["summary"])
-
-    # Generate plots
-    plots_dir = results_dir / "plots"
-    plots_dir.mkdir(exist_ok=True)
-
-    print(f"\nGenerating plots in {plots_dir} ...")
-    plot_success_rate(per_seed, config, plots_dir)
-    plot_exploitation_ratio(per_seed, plots_dir)
-    plot_path_diversity(per_seed, plots_dir)
-    plot_psi_similarity_evolution(data["psi_snapshots"], config, plots_dir)
-    plot_representation_drift(per_seed, plots_dir)
-
-    print("\nDone.")
+    metrics, config, env_config = load_results(args.result_dir)
+    print_summary(metrics, config, env_config)
+    plot_results(metrics, config, env_config, args.result_dir,
+                 show=args.show and not args.no_show)
 
 
 if __name__ == "__main__":
