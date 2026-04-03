@@ -1,24 +1,30 @@
 """
-Metrics collection for continual maze experiments.
+Metrics for continual maze and stochastic-success experiments.
 
 Tracks:
   1. Success rate (per-phase, rolling)
   2. Path diversity (Jaccard distance, route clustering, entropy)
-  3. Trajectory preference (fraction per dominant path)
-  4. Adaptation speed (episodes until first success after phase change)
+  3. Trajectory preference / dominant path fraction
+  4. Adaptation speed (episodes to first success after phase change)
   5. ψ-similarity evolution (snapshots over training)
-  6. Representation drift (L2 / cosine distance across phase transitions)
-  7. Exploitation ratio (fraction using dominant path)
+  6. Representation drift (L2 / cosine across phase transitions)
+  7. Exploitation ratio
+  8. **Policy adaptation index** — KL divergence of the policy between
+     successive snapshots, measuring how much the actor changes its behavior
+  9. **Representation adaptation rate** — rolling speed of ψ change
 """
 
 import numpy as np
 from collections import defaultdict
 from typing import List, Tuple, Dict, Any, Optional
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _trajectory_to_cell_set(traj: List[int]) -> frozenset:
-    """Convert a trajectory (list of state indices) to a set of visited cells."""
     return frozenset(traj)
 
 
@@ -30,57 +36,60 @@ def _jaccard_distance(a: frozenset, b: frozenset) -> float:
 
 def _cluster_trajectories(cell_sets: List[frozenset],
                           threshold: float = 0.5) -> List[int]:
-    """Simple single-linkage clustering of trajectories by Jaccard distance.
-
-    Returns a cluster-id list (same length as cell_sets).
-    """
+    """Single-linkage clustering by Jaccard distance."""
     n = len(cell_sets)
     if n == 0:
         return []
     labels = list(range(n))
-
     for i in range(n):
         for j in range(i + 1, n):
             if _jaccard_distance(cell_sets[i], cell_sets[j]) < threshold:
-                # Merge clusters
                 old, new = max(labels[i], labels[j]), min(labels[i], labels[j])
                 labels = [new if l == old else l for l in labels]
-
-    # Re-index to 0..K-1
     unique = sorted(set(labels))
     remap = {v: k for k, v in enumerate(unique)}
     return [remap[l] for l in labels]
 
 
-class MetricsCollector:
-    """Collects and stores all experiment metrics.
+def _kl_divergence(p: np.ndarray, q: np.ndarray, eps: float = 1e-12) -> float:
+    """Mean KL(p || q) across all states. p, q shape: (S, A)."""
+    p = np.clip(p, eps, 1.0)
+    q = np.clip(q, eps, 1.0)
+    kl_per_state = np.sum(p * np.log(p / q), axis=1)
+    return float(np.mean(kl_per_state))
 
-    Call the `record_*` methods during training; call `finalise()` at the end
-    to compute aggregate statistics.
-    """
+
+# ---------------------------------------------------------------------------
+# MetricsCollector
+# ---------------------------------------------------------------------------
+
+class MetricsCollector:
+    """Collects all metrics during training."""
 
     def __init__(self, num_states: int, maze_shape: Tuple[int, int]):
         self.num_states = num_states
         self.maze_shape = maze_shape
 
-        # Per-episode tracking
+        # Per-episode
         self.episode_success: List[bool] = []
         self.episode_phase: List[int] = []
         self.episode_trajectories: List[List[int]] = []
 
-        # ψ-similarity snapshots: list of (episode, phase, similarity_map)
+        # ψ-similarity snapshots: (episode, phase, sim_map)
         self.psi_snapshots: List[Tuple[int, int, np.ndarray]] = []
 
-        # ψ full embedding snapshots at phase transitions
-        # list of (phase_idx, direction, psi_copy)
-        # direction: "before" or "after"
-        self.psi_transition_snapshots: List[Tuple[int, str, np.ndarray]] = []
+        # Full ψ embedding snapshots: (episode, phase, psi_copy)
+        self.psi_full_snapshots: List[Tuple[int, int, np.ndarray]] = []
 
-        # Phase transition episodes (for adaptation speed)
+        # Phase transition data
+        self.psi_transition_snapshots: List[Tuple[int, str, np.ndarray]] = []
         self.phase_transition_episodes: List[int] = []
 
+        # Policy snapshots for adaptation index: (episode, phase, policy)
+        self.policy_snapshots: List[Tuple[int, int, np.ndarray]] = []
+
     # ------------------------------------------------------------------
-    # Recording methods (called during training)
+    # Recording
     # ------------------------------------------------------------------
 
     def record_episode(self, episode: int, phase_idx: int,
@@ -93,25 +102,34 @@ class MetricsCollector:
                             similarity_map: np.ndarray):
         self.psi_snapshots.append((episode, phase_idx, similarity_map.copy()))
 
+    def record_psi_full_snapshot(self, episode: int, phase_idx: int,
+                                 psi: np.ndarray):
+        self.psi_full_snapshots.append((episode, phase_idx, psi.copy()))
+
     def record_phase_transition(self, episode: int, psi_before: np.ndarray,
                                 psi_after: np.ndarray, phase_idx: int):
         self.phase_transition_episodes.append(episode)
-        self.psi_transition_snapshots.append((phase_idx, "before", psi_before.copy()))
-        self.psi_transition_snapshots.append((phase_idx, "after", psi_after.copy()))
+        self.psi_transition_snapshots.append(
+            (phase_idx, "before", psi_before.copy()))
+        self.psi_transition_snapshots.append(
+            (phase_idx, "after", psi_after.copy()))
+
+    def record_policy_snapshot(self, episode: int, phase_idx: int,
+                               policy: np.ndarray):
+        """Record π(a|s) for all states at a given training step."""
+        self.policy_snapshots.append((episode, phase_idx, policy.copy()))
 
     # ------------------------------------------------------------------
-    # Computed metrics
+    # Standard metrics
     # ------------------------------------------------------------------
 
     def success_rate_per_phase(self) -> Dict[int, float]:
-        """Mean success rate for each phase."""
         phase_successes: Dict[int, List[bool]] = defaultdict(list)
         for p, s in zip(self.episode_phase, self.episode_success):
             phase_successes[p].append(s)
         return {p: float(np.mean(v)) for p, v in sorted(phase_successes.items())}
 
     def rolling_success_rate(self, window: int = 50) -> np.ndarray:
-        """Smoothed success rate curve."""
         arr = np.array(self.episode_success, dtype=float)
         if len(arr) < window:
             return np.cumsum(arr) / (np.arange(len(arr)) + 1)
@@ -120,7 +138,6 @@ class MetricsCollector:
 
     def path_diversity_per_phase(self, cluster_threshold: float = 0.5
                                  ) -> Dict[int, Dict[str, float]]:
-        """Per-phase path diversity metrics for *successful* trajectories."""
         phase_trajs: Dict[int, List[List[int]]] = defaultdict(list)
         for p, traj, succ in zip(self.episode_phase,
                                  self.episode_trajectories,
@@ -140,8 +157,6 @@ class MetricsCollector:
                 continue
 
             cell_sets = [_trajectory_to_cell_set(t) for t in trajs]
-
-            # Mean pairwise Jaccard distance
             n = len(cell_sets)
             dists = []
             for i in range(n):
@@ -149,11 +164,8 @@ class MetricsCollector:
                     dists.append(_jaccard_distance(cell_sets[i], cell_sets[j]))
             mean_jaccard = float(np.mean(dists)) if dists else 0.0
 
-            # Clustering
             labels = _cluster_trajectories(cell_sets, cluster_threshold)
             num_clusters = len(set(labels))
-
-            # Entropy over cluster distribution
             counts = np.bincount(labels)
             probs = counts / counts.sum()
             entropy = float(-np.sum(probs * np.log(probs + 1e-12)))
@@ -168,7 +180,6 @@ class MetricsCollector:
 
     def trajectory_preference(self, cluster_threshold: float = 0.5
                               ) -> Dict[int, Dict[str, Any]]:
-        """Per-phase: fraction of successful episodes using each route cluster."""
         phase_trajs: Dict[int, List[List[int]]] = defaultdict(list)
         for p, traj, succ in zip(self.episode_phase,
                                  self.episode_trajectories,
@@ -192,7 +203,6 @@ class MetricsCollector:
         return results
 
     def adaptation_speed(self) -> Dict[int, Optional[int]]:
-        """Episodes from phase transition to first success, per phase."""
         results = {}
         transitions = [0] + self.phase_transition_episodes
         for idx, start_ep in enumerate(transitions):
@@ -207,9 +217,7 @@ class MetricsCollector:
         return results
 
     def representation_drift(self) -> List[Dict[str, Any]]:
-        """L2 and cosine drift of ψ across each phase transition."""
         results = []
-        # Pair up (before, after) for each transition
         before_map: Dict[int, np.ndarray] = {}
         after_map: Dict[int, np.ndarray] = {}
         for phase_idx, direction, psi in self.psi_transition_snapshots:
@@ -221,9 +229,7 @@ class MetricsCollector:
         for phase_idx in sorted(set(before_map) & set(after_map)):
             psi_b = before_map[phase_idx]
             psi_a = after_map[phase_idx]
-            # Mean L2 distance
             l2 = float(np.mean(np.linalg.norm(psi_a - psi_b, axis=1)))
-            # Mean cosine similarity
             dots = np.sum(psi_a * psi_b, axis=1)
             norms = (np.linalg.norm(psi_a, axis=1) *
                      np.linalg.norm(psi_b, axis=1) + 1e-12)
@@ -237,16 +243,67 @@ class MetricsCollector:
 
     def exploitation_ratio(self, cluster_threshold: float = 0.5
                            ) -> Dict[int, float]:
-        """Per-phase fraction of successful episodes using the dominant path."""
         prefs = self.trajectory_preference(cluster_threshold)
         return {p: v["dominant_fraction"] for p, v in prefs.items()}
+
+    # ------------------------------------------------------------------
+    # Adaptation-specific metrics
+    # ------------------------------------------------------------------
+
+    def policy_adaptation_index(self) -> List[Dict[str, Any]]:
+        """KL divergence between successive policy snapshots.
+
+        Measures how much the actor's policy changed between two snapshots.
+        Large KL at phase transitions = the agent is adapting its behavior.
+        Small KL at phase transitions = the agent is stuck on old policy.
+        """
+        results = []
+        for i in range(1, len(self.policy_snapshots)):
+            ep_prev, phase_prev, pol_prev = self.policy_snapshots[i - 1]
+            ep_curr, phase_curr, pol_curr = self.policy_snapshots[i]
+            kl = _kl_divergence(pol_curr, pol_prev)
+            results.append({
+                "episode_from": int(ep_prev),
+                "episode_to": int(ep_curr),
+                "phase_from": int(phase_prev),
+                "phase_to": int(phase_curr),
+                "kl_divergence": kl,
+                "is_phase_transition": phase_prev != phase_curr,
+            })
+        return results
+
+    def representation_adaptation_rate(self) -> List[Dict[str, Any]]:
+        """Rolling rate of ψ change between successive full snapshots.
+
+        Computes mean L2 distance of ψ vectors between consecutive snapshots.
+        High rate = representations are actively being reshaped.
+        Low rate = representations have settled / agent stopped adapting.
+        """
+        results = []
+        for i in range(1, len(self.psi_full_snapshots)):
+            ep_prev, phase_prev, psi_prev = self.psi_full_snapshots[i - 1]
+            ep_curr, phase_curr, psi_curr = self.psi_full_snapshots[i]
+            l2 = float(np.mean(np.linalg.norm(psi_curr - psi_prev, axis=1)))
+            # Also compute cosine distance
+            dots = np.sum(psi_curr * psi_prev, axis=1)
+            norms = (np.linalg.norm(psi_curr, axis=1) *
+                     np.linalg.norm(psi_prev, axis=1) + 1e-12)
+            cos_dist = float(1.0 - np.mean(dots / norms))
+            results.append({
+                "episode_from": int(ep_prev),
+                "episode_to": int(ep_curr),
+                "phase_from": int(phase_prev),
+                "phase_to": int(phase_curr),
+                "mean_l2_rate": l2,
+                "mean_cosine_distance": cos_dist,
+            })
+        return results
 
     # ------------------------------------------------------------------
     # Serialisation
     # ------------------------------------------------------------------
 
     def to_dict(self) -> Dict[str, Any]:
-        """Serialise all computed metrics to a JSON-friendly dict."""
         return {
             "success_rate_per_phase": self.success_rate_per_phase(),
             "rolling_success_rate": self.rolling_success_rate().tolist(),
@@ -261,6 +318,9 @@ class MetricsCollector:
             "exploitation_ratio": {
                 str(k): v for k, v in self.exploitation_ratio().items()
             },
+            "policy_adaptation_index": self.policy_adaptation_index(),
+            "representation_adaptation_rate":
+                self.representation_adaptation_rate(),
             "psi_snapshots": [
                 {"episode": ep, "phase": ph, "similarity_map": sm.tolist()}
                 for ep, ph, sm in self.psi_snapshots

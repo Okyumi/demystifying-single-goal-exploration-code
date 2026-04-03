@@ -1,0 +1,19 @@
+{
+  "mode": "continual",
+  "rep_dim": 16,
+  "lr_psi": 0.01,
+  "batch_size": 128,
+  "replay_capacity": 1500,
+  "max_steps": 80,
+  "gamma": 0.99,
+  "entropy_coeff": 0.1,
+  "episodes_per_update": 1,
+  "normalize": true,
+  "episodes_per_phase": 600,
+  "seed": 42,
+  "eval_freq": 5,
+  "psi_snapshot_freq": 10,
+  "policy_snapshot_freq": 25,
+  "clear_replay_on_transition": false,
+  "output_dir": null
+}

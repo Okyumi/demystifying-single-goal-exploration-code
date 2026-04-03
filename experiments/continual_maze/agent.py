@@ -1,15 +1,13 @@
 """
-Tabular SGCRL agent adapted for the ContinualMaze environment.
+Tabular SGCRL agents for ContinualMaze and StochasticSuccessMaze.
 
-This is a modular extraction of the SGCRLAgent from tabular_maze.ipynb,
-generalised so the step function is provided by a ContinualMaze instance
-rather than a module-level global.
+Two agent classes:
+1. TabularSGCRLAgent — deterministic maze, success = reaching the goal cell
+2. StochasticSGCRLAgent — success depends on approach direction (inherits from above)
 """
 
 import numpy as np
 from typing import List, Tuple, Optional, Dict, Any
-
-from .envs.continual_maze import ContinualMaze
 
 
 class TabularSGCRLAgent:
@@ -17,34 +15,24 @@ class TabularSGCRLAgent:
 
     Parameters
     ----------
-    env : ContinualMaze
-        The maze environment (provides step(), start_state, goal_state, etc.).
-    rep_dim : int
-        Dimensionality of the ψ embeddings.
-    lr_psi : float
-        Learning rate for embedding updates.
-    batch_size : int
-        Number of (s, s⁺) pairs per contrastive update.
-    replay_capacity : int
-        Maximum number of trajectories in the replay buffer.
-    max_steps : int
-        Maximum steps per episode.
-    gamma : float
-        Discount factor for geometric future-state sampling.
-    entropy_coeff : float
-        Temperature for softmax action selection (lower = greedier).
-    episodes_per_update : int
-        How often to run a contrastive update (in episodes).
-    normalize : bool
-        Whether to L2-normalize embeddings after each update.
+    env : ContinualMaze or StochasticSuccessMaze
+    rep_dim : dimensionality of ψ embeddings
+    lr_psi : learning rate for embedding updates
+    batch_size : pairs per contrastive update
+    replay_capacity : max trajectories in replay buffer
+    max_steps : max steps per episode
+    gamma : discount for geometric future-state sampling
+    entropy_coeff : softmax temperature (lower = greedier)
+    episodes_per_update : contrastive updates every N episodes
+    normalize : L2-normalize embeddings after each update
     """
 
-    def __init__(self, env: ContinualMaze, *,
+    def __init__(self, env, *,
                  rep_dim: int = 16,
                  lr_psi: float = 1e-2,
                  batch_size: int = 128,
                  replay_capacity: int = 1000,
-                 max_steps: int = 50,
+                 max_steps: int = 80,
                  gamma: float = 0.99,
                  entropy_coeff: float = 0.1,
                  episodes_per_update: int = 1,
@@ -63,19 +51,18 @@ class TabularSGCRLAgent:
         self.goal = env.goal_state
         self.start = env.start_state
 
-        # ψ embeddings — initialised near the goal embedding
+        # ψ embeddings
         self.psi = np.empty((env.num_states, rep_dim))
         self._init_psi()
 
-        # Replay buffer: list of state-index trajectories
+        # Replay buffer
         self.replay: List[List[int]] = []
 
     # ------------------------------------------------------------------
-    # Initialisation helpers
+    # Initialisation
     # ------------------------------------------------------------------
 
     def _init_psi(self):
-        """Initialise all ψ embeddings near a random goal vector."""
         psi_goal = np.random.randn(self.rep_dim) * 0.1
         self.psi[self.goal] = psi_goal
         if self.normalize:
@@ -93,7 +80,7 @@ class TabularSGCRLAgent:
     # ------------------------------------------------------------------
 
     def select_action(self, state: int) -> int:
-        """Softmax (exploratory) action selection based on ψ(s')·ψ(g)."""
+        """Softmax action selection based on ψ(s')·ψ(g)."""
         goal_vec = self.psi[self.goal]
         sims = np.array([
             self.psi[self.env.step(state, a)] @ goal_vec
@@ -106,7 +93,7 @@ class TabularSGCRLAgent:
         return int(np.random.choice(self.env.NUM_ACTIONS, p=probs))
 
     def eval_action(self, state: int) -> int:
-        """Greedy (deterministic) action selection."""
+        """Greedy action selection."""
         goal_vec = self.psi[self.goal]
         best_a, best_val = 0, -np.inf
         for a in range(self.env.NUM_ACTIONS):
@@ -116,6 +103,25 @@ class TabularSGCRLAgent:
                 best_val = val
                 best_a = a
         return best_a
+
+    # ------------------------------------------------------------------
+    # Policy distribution (for adaptation metrics)
+    # ------------------------------------------------------------------
+
+    def get_policy_distribution(self) -> np.ndarray:
+        """Return π(a|s) for all states as (num_states, NUM_ACTIONS) array."""
+        goal_vec = self.psi[self.goal]
+        policy = np.zeros((self.env.num_states, self.env.NUM_ACTIONS))
+        for s in range(self.env.num_states):
+            sims = np.array([
+                self.psi[self.env.step(s, a)] @ goal_vec
+                for a in range(self.env.NUM_ACTIONS)
+            ])
+            logits = sims / self.entropy_coeff
+            logits -= logits.max()
+            exp_l = np.exp(logits)
+            policy[s] = exp_l / exp_l.sum()
+        return policy
 
     # ------------------------------------------------------------------
     # Episode collection
@@ -131,14 +137,13 @@ class TabularSGCRLAgent:
             traj.append(ns)
             if self.env.is_goal(ns) or self.env.is_near_goal(ns):
                 reached_goal = True
-        # Add to replay
         self.replay.append(traj)
         if len(self.replay) > self.replay_capacity:
             self.replay.pop(0)
         return traj, reached_goal
 
     def run_eval_episode(self) -> Tuple[List[int], bool]:
-        """Run one deterministic evaluation episode."""
+        """Greedy evaluation episode."""
         traj = [self.start]
         reached_goal = False
         for _ in range(self.max_steps):
@@ -150,18 +155,16 @@ class TabularSGCRLAgent:
         return traj, reached_goal
 
     # ------------------------------------------------------------------
-    # Contrastive representation update
+    # Contrastive update
     # ------------------------------------------------------------------
 
     def update_representations(self) -> float:
-        """Vectorised InfoNCE contrastive update on ψ embeddings.
-
-        Returns the mean negative log-likelihood (loss).
-        """
+        """InfoNCE contrastive update. Returns mean NLL loss."""
         if len(self.replay) < 2:
             return 0.0
 
-        traj_ids = np.random.choice(len(self.replay), self.batch_size, replace=True)
+        traj_ids = np.random.choice(len(self.replay), self.batch_size,
+                                     replace=True)
         s_list, sp_list = [], []
         for idx in traj_ids:
             traj = self.replay[idx]
@@ -182,10 +185,9 @@ class TabularSGCRLAgent:
         sp_batch = np.asarray(sp_list, dtype=np.int32)
         B = len(s_batch)
 
-        psi_s = self.psi[s_batch]    # (B, D)
-        psi_p = self.psi[sp_batch]   # (B, D)
+        psi_s = self.psi[s_batch]
+        psi_p = self.psi[sp_batch]
 
-        # Column-wise softmax
         dots = psi_s @ psi_p.T
         dots -= dots.max(axis=0, keepdims=True)
         exp_d = np.exp(dots)
@@ -193,7 +195,6 @@ class TabularSGCRLAgent:
 
         nll = -np.mean(np.log(np.diag(P) + 1e-12))
 
-        # Gradient updates
         coeff = np.eye(B) - P
         np.add.at(self.psi, s_batch, self.lr_psi * (coeff @ psi_p))
         np.add.at(self.psi, sp_batch, self.lr_psi * (psi_s - P.T @ psi_s))
@@ -205,15 +206,14 @@ class TabularSGCRLAgent:
         return nll
 
     # ------------------------------------------------------------------
-    # Snapshot / restore
+    # Snapshots
     # ------------------------------------------------------------------
 
     def get_psi_snapshot(self) -> np.ndarray:
-        """Return a copy of the current ψ embedding table."""
         return self.psi.copy()
 
     def get_similarity_map(self) -> np.ndarray:
-        """Compute ψ(s)·ψ(g) for every state, reshaped to (H, W)."""
+        """ψ(s)·ψ(g) for every state, shaped (H, W)."""
         goal_vec = self.psi[self.goal]
         g_norm = np.linalg.norm(goal_vec) + 1e-8
         s_norms = np.linalg.norm(self.psi, axis=1) + 1e-8
@@ -221,5 +221,97 @@ class TabularSGCRLAgent:
         return sims.reshape(self.env.height, self.env.width)
 
     def clear_replay(self):
-        """Empty the replay buffer (useful at phase transitions)."""
         self.replay.clear()
+
+
+# ---------------------------------------------------------------------------
+# StochasticSGCRLAgent
+# ---------------------------------------------------------------------------
+
+class StochasticSGCRLAgent(TabularSGCRLAgent):
+    """SGCRL agent for StochasticSuccessMaze.
+
+    Same contrastive representation learning, but success is stochastic:
+    the agent only gets a "success" signal probabilistically when it reaches
+    the goal, depending on the approach direction.
+
+    Only successful trajectories are added to the replay buffer (the agent
+    learns from trajectories that led to "actual" success).
+    """
+
+    def __init__(self, env, **kwargs):
+        super().__init__(env, **kwargs)
+        # Track approach statistics
+        self.approach_counts: Dict[str, int] = {}
+        self.approach_successes: Dict[str, int] = {}
+
+    def collect_episode(self) -> Tuple[List[int], bool, Optional[str]]:
+        """Run one episode. Returns (trajectory, success, approach_direction).
+
+        The agent reaches the goal cell deterministically, but success is
+        stochastic — depends on the direction of the final approach step.
+        Only successful episodes are added to the replay buffer.
+        """
+        traj = [self.start]
+        reached_goal_cell = False
+        success = False
+        approach_dir = None
+
+        for step_idx in range(self.max_steps):
+            a = self.select_action(traj[-1])
+            ns = self.env.step(traj[-1], a)
+            traj.append(ns)
+
+            if self.env.is_goal(ns):
+                reached_goal_cell = True
+                # Check stochastic success
+                prev = traj[-2]
+                success, approach_dir, prob = \
+                    self.env.check_stochastic_success(prev, ns)
+
+                # Track approach stats
+                self.approach_counts[approach_dir] = \
+                    self.approach_counts.get(approach_dir, 0) + 1
+                if success:
+                    self.approach_successes[approach_dir] = \
+                        self.approach_successes.get(approach_dir, 0) + 1
+                break
+
+        # Only add successful episodes to replay
+        if success:
+            self.replay.append(traj)
+            if len(self.replay) > self.replay_capacity:
+                self.replay.pop(0)
+
+        return traj, success, approach_dir
+
+    def run_eval_episode(self) -> Tuple[List[int], bool, Optional[str]]:
+        """Greedy evaluation with stochastic success."""
+        traj = [self.start]
+        success = False
+        approach_dir = None
+
+        for _ in range(self.max_steps):
+            a = self.eval_action(traj[-1])
+            ns = self.env.step(traj[-1], a)
+            traj.append(ns)
+            if self.env.is_goal(ns):
+                prev = traj[-2]
+                success, approach_dir, _ = \
+                    self.env.check_stochastic_success(prev, ns)
+                break
+
+        return traj, success, approach_dir
+
+    def get_approach_stats(self) -> Dict[str, Dict[str, Any]]:
+        """Return approach direction statistics."""
+        stats = {}
+        for d in self.approach_counts:
+            attempts = self.approach_counts[d]
+            successes = self.approach_successes.get(d, 0)
+            stats[d] = {
+                "attempts": attempts,
+                "successes": successes,
+                "empirical_rate": successes / attempts if attempts > 0 else 0.0,
+            }
+        return stats
