@@ -278,7 +278,7 @@ def make_fourrooms_maze(goal_state: Optional[int] = None) -> ContinualMaze:
     walls = create_phase0_walls()
     goal = goal_state or np.ravel_multi_index((10, 10), (11, 11))
     phases = [MazePhase(name="fourrooms", walls=walls,
-                        num_episodes=3000,
+                        num_episodes=10000,
                         description="Standard FourRooms")]
     return ContinualMaze(phases=phases, height=11, width=11,
                          start_state=0, goal_state=goal)
@@ -297,7 +297,7 @@ def make_stochastic_fourrooms_maze(
     )
 
 
-def make_changing_dynamics_maze(episodes_per_phase: int = 1000) -> ContinualMaze:
+def make_changing_dynamics_maze(episodes_per_phase: int = 5000) -> ContinualMaze:
     """3-phase changing dynamics: fourrooms -> corridor_shift -> l_wall."""
     goal = np.ravel_multi_index((10, 10), (11, 11))
     phases = [
@@ -324,12 +324,12 @@ def make_changing_dynamics_maze(episodes_per_phase: int = 1000) -> ContinualMaze
                          start_state=0, goal_state=goal)
 
 
-def make_static_fourrooms_3000(goal_state: Optional[int] = None) -> ContinualMaze:
-    """Static FourRooms for 3000 episodes (baseline for Study B)."""
+def make_static_fourrooms(goal_state: Optional[int] = None) -> ContinualMaze:
+    """Static FourRooms for 15000 episodes (baseline for Study B)."""
     walls = create_phase0_walls()
     goal = goal_state or np.ravel_multi_index((10, 10), (11, 11))
     phases = [MazePhase(name="fourrooms", walls=walls,
-                        num_episodes=3000,
+                        num_episodes=15000,
                         description="Static FourRooms baseline")]
     return ContinualMaze(phases=phases, height=11, width=11,
                          start_state=0, goal_state=goal)

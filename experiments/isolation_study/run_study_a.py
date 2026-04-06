@@ -8,7 +8,7 @@ Compares:
   A2-stochastic-allreplay: Direction-dependent success, ALL trajectories in replay
   A2-stochastic-successonly: Direction-dependent success, only successes in replay
 
-3000 episodes each condition, max_steps=120.
+10000 episodes each condition, max_steps=120.
 
 Usage:
   python experiments/isolation_study/run_study_a.py --seed 42
@@ -51,9 +51,9 @@ CONFIG = {
     "entropy_coeff": 0.1,
     "episodes_per_update": 1,
     "normalize": True,
-    "total_episodes": 3000,
-    "psi_snapshot_freq": 25,
-    "policy_snapshot_freq": 25,
+    "total_episodes": 10000,
+    "psi_snapshot_freq": 50,
+    "policy_snapshot_freq": 50,
     "approach_probs": {
         "from_above": 0.10,
         "from_left":  0.25,
@@ -106,8 +106,8 @@ def run_a1_baseline(cfg, seed, output_dir):
             sim_map = agent.get_similarity_map()
             metrics.record_psi_snapshot(ep, 0, sim_map)
             metrics.record_psi_full_snapshot(ep, 0, agent.get_psi_snapshot())
-            greedy_traj = agent.greedy_rollout()
-            metrics.record_greedy_trajectory(ep, 0, greedy_traj)
+            policy_traj = agent.policy_rollout()
+            metrics.record_greedy_trajectory(ep, 0, policy_traj)
 
         if ep % cfg["policy_snapshot_freq"] == 0:
             policy = agent.get_policy_distribution()
@@ -154,8 +154,8 @@ def run_a2_stochastic_allreplay(cfg, seed, output_dir):
             sim_map = agent.get_similarity_map()
             metrics.record_psi_snapshot(ep, 0, sim_map)
             metrics.record_psi_full_snapshot(ep, 0, agent.get_psi_snapshot())
-            greedy_traj = agent.greedy_rollout()
-            metrics.record_greedy_trajectory(ep, 0, greedy_traj)
+            policy_traj = agent.policy_rollout()
+            metrics.record_greedy_trajectory(ep, 0, policy_traj)
 
         if ep % cfg["policy_snapshot_freq"] == 0:
             policy = agent.get_policy_distribution()
@@ -205,8 +205,8 @@ def run_a2_stochastic_successonly(cfg, seed, output_dir):
             sim_map = agent.get_similarity_map()
             metrics.record_psi_snapshot(ep, 0, sim_map)
             metrics.record_psi_full_snapshot(ep, 0, agent.get_psi_snapshot())
-            greedy_traj = agent.greedy_rollout()
-            metrics.record_greedy_trajectory(ep, 0, greedy_traj)
+            policy_traj = agent.policy_rollout()
+            metrics.record_greedy_trajectory(ep, 0, policy_traj)
 
         if ep % cfg["policy_snapshot_freq"] == 0:
             policy = agent.get_policy_distribution()

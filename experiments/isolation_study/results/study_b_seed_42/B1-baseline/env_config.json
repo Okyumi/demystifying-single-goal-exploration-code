@@ -6,7 +6,7 @@
   "phases": [
     {
       "name": "fourrooms",
-      "num_episodes": 3000,
+      "num_episodes": 15000,
       "description": "Static FourRooms baseline",
       "walls": [
         [

@@ -1,0 +1,12 @@
+{
+  "from_above": {
+    "attempts": 3,
+    "successes": 0,
+    "empirical_rate": 0.0
+  },
+  "from_left": {
+    "attempts": 7700,
+    "successes": 1945,
+    "empirical_rate": 0.2525974025974026
+  }
+}

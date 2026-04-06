@@ -119,8 +119,9 @@ class TabularSGCRLAgent:
             a = self.select_action(traj[-1])
             ns = self.env.step(traj[-1], a)
             traj.append(ns)
-            if self.env.is_goal(ns) or self.env.is_near_goal(ns):
+            if self.env.is_goal(ns):
                 reached_goal = True
+                break
         self.replay.append(traj)
         if len(self.replay) > self.replay_capacity:
             self.replay.pop(0)
@@ -133,8 +134,9 @@ class TabularSGCRLAgent:
             a = self.eval_action(traj[-1])
             ns = self.env.step(traj[-1], a)
             traj.append(ns)
-            if self.env.is_goal(ns) or self.env.is_near_goal(ns):
+            if self.env.is_goal(ns):
                 reached_goal = True
+                break
         return traj, reached_goal
 
     def greedy_rollout(self) -> List[int]:
@@ -147,6 +149,42 @@ class TabularSGCRLAgent:
             if self.env.is_goal(ns):
                 break
         return traj
+
+    def policy_rollout(self, n_rollouts: int = 5) -> List[int]:
+        """Roll out the stochastic policy multiple times, return the best trajectory.
+
+        Uses select_action (softmax policy) instead of eval_action (argmax).
+        Returns the trajectory that gets closest to the goal, breaking ties
+        by shortest length.
+        """
+        goal_coord = np.array(np.unravel_index(self.goal, (self.env.height, self.env.width)))
+        best_traj = None
+        best_dist = float('inf')
+        best_len = float('inf')
+
+        for _ in range(n_rollouts):
+            traj = [self.start]
+            for _ in range(self.max_steps):
+                a = self.select_action(traj[-1])
+                ns = self.env.step(traj[-1], a)
+                traj.append(ns)
+                if self.env.is_goal(ns):
+                    break
+
+            # Score: minimum Manhattan distance to goal achieved during rollout
+            min_dist = float('inf')
+            for s in traj:
+                coord = np.array(np.unravel_index(s, (self.env.height, self.env.width)))
+                dist = np.abs(coord - goal_coord).sum()
+                if dist < min_dist:
+                    min_dist = dist
+
+            if min_dist < best_dist or (min_dist == best_dist and len(traj) < best_len):
+                best_dist = min_dist
+                best_len = len(traj)
+                best_traj = traj
+
+        return best_traj
 
     def update_representations(self) -> float:
         if len(self.replay) < 2:

@@ -151,7 +151,8 @@ class MetricsCollector:
     # M2: Path Diversity (Jaccard + clustering)
     # ------------------------------------------------------------------
 
-    def m2_path_diversity(self, cluster_threshold: float = 0.5
+    def m2_path_diversity(self, cluster_threshold: float = 0.5,
+                          max_sample: int = 200
                           ) -> Dict[int, Dict[str, float]]:
         """M2: Path Diversity (Jaccard distance + route clustering + entropy).
 
@@ -185,7 +186,14 @@ class MetricsCollector:
                 }
                 continue
 
-            cell_sets = [_trajectory_to_cell_set(t) for t in trajs]
+            # Sample if too many trajectories (O(n^2) otherwise)
+            if len(trajs) > max_sample:
+                idx = np.random.choice(len(trajs), max_sample, replace=False)
+                sampled = [trajs[i] for i in idx]
+            else:
+                sampled = trajs
+
+            cell_sets = [_trajectory_to_cell_set(t) for t in sampled]
             n = len(cell_sets)
             dists = []
             for i in range(n):
@@ -211,7 +219,8 @@ class MetricsCollector:
     # M3: Exploitation Ratio
     # ------------------------------------------------------------------
 
-    def m3_exploitation_ratio(self, cluster_threshold: float = 0.5
+    def m3_exploitation_ratio(self, cluster_threshold: float = 0.5,
+                              max_sample: int = 200
                               ) -> Dict[int, float]:
         """M3: Exploitation Ratio.
 
@@ -235,7 +244,13 @@ class MetricsCollector:
             if not trajs:
                 results[p] = 0.0
                 continue
-            cell_sets = [_trajectory_to_cell_set(t) for t in trajs]
+            # Sample if too many trajectories
+            if len(trajs) > max_sample:
+                idx = np.random.choice(len(trajs), max_sample, replace=False)
+                sampled = [trajs[i] for i in idx]
+            else:
+                sampled = trajs
+            cell_sets = [_trajectory_to_cell_set(t) for t in sampled]
             labels = _cluster_trajectories(cell_sets, cluster_threshold)
             counts = np.bincount(labels)
             results[p] = float(np.max(counts) / counts.sum())
@@ -504,8 +519,8 @@ class MetricsCollector:
                 self.m8_representation_route_alignment(),
             "m9_phase_transition_recovery":
                 self.m9_phase_transition_recovery(),
-            "psi_snapshots": [
-                {"episode": ep, "phase": ph, "similarity_map": sm.tolist()}
+            "psi_snapshot_episodes": [
+                {"episode": ep, "phase": ph}
                 for ep, ph, sm in self.psi_snapshots
             ],
             "total_episodes": len(self.episode_success),

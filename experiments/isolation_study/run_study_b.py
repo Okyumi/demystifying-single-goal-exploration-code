@@ -3,10 +3,10 @@
 Study B: Changing Dynamics Isolation.
 
 Goal fixed at (10,10). Compares:
-  B1-baseline: Static FourRooms for all 3000 episodes
-  B2-changing: 3 phases x 1000 episodes (fourrooms -> corridor_shift -> l_wall)
+  B1-baseline: Static FourRooms for all 15000 episodes
+  B2-changing: 3 phases x 5000 episodes (fourrooms -> corridor_shift -> l_wall)
 
-3000 total episodes, max_steps=120.
+15000 total episodes, max_steps=120.
 
 Usage:
   python experiments/isolation_study/run_study_b.py --seed 42
@@ -23,7 +23,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from envs import make_static_fourrooms_3000, make_changing_dynamics_maze
+from envs import make_static_fourrooms, make_changing_dynamics_maze
 from agent import TabularSGCRLAgent
 from metrics import MetricsCollector
 from visualization import (
@@ -42,10 +42,10 @@ CONFIG = {
     "entropy_coeff": 0.1,
     "episodes_per_update": 1,
     "normalize": True,
-    "total_episodes": 3000,
-    "episodes_per_phase": 1000,
-    "psi_snapshot_freq": 25,
-    "policy_snapshot_freq": 25,
+    "total_episodes": 15000,
+    "episodes_per_phase": 5000,
+    "psi_snapshot_freq": 50,
+    "policy_snapshot_freq": 50,
 }
 
 
@@ -73,7 +73,7 @@ def run_b1_baseline(cfg, seed, output_dir):
     print("=" * 60)
     np.random.seed(seed)
 
-    env = make_static_fourrooms_3000()
+    env = make_static_fourrooms()
     agent = TabularSGCRLAgent(env, **agent_kwargs(cfg))
     metrics = MetricsCollector(env.num_states, (env.height, env.width))
 
@@ -91,8 +91,8 @@ def run_b1_baseline(cfg, seed, output_dir):
             sim_map = agent.get_similarity_map()
             metrics.record_psi_snapshot(ep, 0, sim_map)
             metrics.record_psi_full_snapshot(ep, 0, agent.get_psi_snapshot())
-            greedy_traj = agent.greedy_rollout()
-            metrics.record_greedy_trajectory(ep, 0, greedy_traj)
+            policy_traj = agent.policy_rollout()
+            metrics.record_greedy_trajectory(ep, 0, policy_traj)
 
         if ep % cfg["policy_snapshot_freq"] == 0:
             policy = agent.get_policy_distribution()
@@ -167,8 +167,8 @@ def run_b2_changing(cfg, seed, output_dir):
             metrics.record_psi_snapshot(ep, current_phase_idx, sim_map)
             metrics.record_psi_full_snapshot(
                 ep, current_phase_idx, agent.get_psi_snapshot())
-            greedy_traj = agent.greedy_rollout()
-            metrics.record_greedy_trajectory(ep, current_phase_idx, greedy_traj)
+            policy_traj = agent.policy_rollout()
+            metrics.record_greedy_trajectory(ep, current_phase_idx, policy_traj)
 
         if ep % cfg["policy_snapshot_freq"] == 0:
             policy = agent.get_policy_distribution()

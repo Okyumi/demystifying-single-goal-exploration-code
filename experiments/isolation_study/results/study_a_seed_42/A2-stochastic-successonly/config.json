@@ -8,14 +8,14 @@
   "entropy_coeff": 0.1,
   "episodes_per_update": 1,
   "normalize": true,
-  "total_episodes": 3000,
-  "psi_snapshot_freq": 25,
-  "policy_snapshot_freq": 25,
   "approach_probs": {
     "from_above": 0.1,
     "from_left": 0.25,
     "from_right": 0.5,
     "from_below": 0.8,
     "stay": 0.0
-  }
+  },
+  "snap_freq": 200,
+  "condition": "A2-successonly",
+  "total_episodes": 10000
 }

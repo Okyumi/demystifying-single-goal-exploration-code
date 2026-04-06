@@ -6,7 +6,7 @@
   "phases": [
     {
       "name": "fourrooms",
-      "num_episodes": 1000,
+      "num_episodes": 5000,
       "description": "Standard FourRooms: doors at (2,5),(8,5),(5,2),(5,8)",
       "walls": [
         [
@@ -156,7 +156,7 @@
     },
     {
       "name": "corridor_shift",
-      "num_episodes": 1000,
+      "num_episodes": 5000,
       "description": "Corridor-shift: doors at (2,5),(5,8) only",
       "walls": [
         [
@@ -306,7 +306,7 @@
     },
     {
       "name": "l_wall",
-      "num_episodes": 1000,
+      "num_episodes": 5000,
       "description": "L-wall: bottleneck at (4,3) and (7,8)",
       "walls": [
         [

@@ -6,7 +6,7 @@
   "phases": [
     {
       "name": "fourrooms",
-      "num_episodes": 3000,
+      "num_episodes": 10000,
       "description": "Standard FourRooms",
       "walls": [
         [
