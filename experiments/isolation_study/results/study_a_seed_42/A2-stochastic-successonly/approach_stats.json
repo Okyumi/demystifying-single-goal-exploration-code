@@ -1,12 +1,17 @@
 {
   "from_above": {
-    "attempts": 3,
-    "successes": 0,
-    "empirical_rate": 0.0
+    "attempts": 1915,
+    "successes": 197,
+    "empirical_rate": 0.10287206266318538
+  },
+  "from_below": {
+    "attempts": 196,
+    "successes": 162,
+    "empirical_rate": 0.826530612244898
   },
   "from_left": {
-    "attempts": 7700,
-    "successes": 1945,
-    "empirical_rate": 0.2525974025974026
+    "attempts": 6825,
+    "successes": 1702,
+    "empirical_rate": 0.24937728937728937
   }
 }

@@ -1,12 +1,22 @@
 {
-  "from_above": {
-    "attempts": 3256,
-    "successes": 327,
-    "empirical_rate": 0.10042997542997543
-  },
   "from_left": {
-    "attempts": 5155,
-    "successes": 1331,
-    "empirical_rate": 0.25819592628516
+    "attempts": 1313,
+    "successes": 332,
+    "empirical_rate": 0.25285605483625284
+  },
+  "from_right": {
+    "attempts": 343,
+    "successes": 179,
+    "empirical_rate": 0.521865889212828
+  },
+  "from_above": {
+    "attempts": 7911,
+    "successes": 755,
+    "empirical_rate": 0.09543673366198964
+  },
+  "from_below": {
+    "attempts": 95,
+    "successes": 78,
+    "empirical_rate": 0.8210526315789474
   }
 }

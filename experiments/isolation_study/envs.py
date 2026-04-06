@@ -274,9 +274,10 @@ class StochasticSuccessMaze:
 # ---------------------------------------------------------------------------
 
 def make_fourrooms_maze(goal_state: Optional[int] = None) -> ContinualMaze:
-    """Single-phase FourRooms maze for baseline conditions."""
+    """Single-phase FourRooms maze for baseline conditions.
+    Goal at (8,8) — interior cell with all 4 neighbors open."""
     walls = create_phase0_walls()
-    goal = goal_state or np.ravel_multi_index((10, 10), (11, 11))
+    goal = goal_state if goal_state is not None else np.ravel_multi_index((8, 8), (11, 11))
     phases = [MazePhase(name="fourrooms", walls=walls,
                         num_episodes=10000,
                         description="Standard FourRooms")]
@@ -287,12 +288,14 @@ def make_fourrooms_maze(goal_state: Optional[int] = None) -> ContinualMaze:
 def make_stochastic_fourrooms_maze(
     approach_probs: Optional[Dict[str, float]] = None,
 ) -> StochasticSuccessMaze:
-    """FourRooms maze with stochastic direction-dependent success."""
+    """FourRooms maze with stochastic direction-dependent success.
+    Goal at (8,8) — interior cell with all 4 neighbors open,
+    so all 4 approach directions are physically reachable."""
     walls = create_phase0_walls()
     return StochasticSuccessMaze(
         walls=walls, height=11, width=11,
         start_state=0,
-        goal_state=np.ravel_multi_index((10, 10), (11, 11)),
+        goal_state=np.ravel_multi_index((8, 8), (11, 11)),
         approach_probs=approach_probs,
     )
 

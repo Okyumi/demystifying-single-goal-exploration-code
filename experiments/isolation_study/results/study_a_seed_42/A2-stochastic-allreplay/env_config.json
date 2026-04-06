@@ -3,7 +3,7 @@
   "height": 11,
   "width": 11,
   "start_state": 0,
-  "goal_state": 120,
+  "goal_state": 96,
   "approach_probs": {
     "from_above": 0.1,
     "from_left": 0.25,
